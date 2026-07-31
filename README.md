@@ -9,6 +9,9 @@ This document describes the main UI, shortcuts, debugging features, trace featur
 Z0BPcTools3 是一个 Windows 用户态调试器，界面采用多文档窗口结构。调试会话打开后，可以通过菜单或快捷键打开 CPU、内存、堆栈、模块、线程、断点、补丁、调用栈、句柄、窗口、SEH 链、引用、源代码等窗口。
 
 Z0BPcTools3 is a Windows user-mode debugger with an MDI-style interface. After a debug session starts, you can open CPU, memory, stack, modules, threads, breakpoints, patches, call stack, handles, windows, SEH chain, references, source code, and other views from menus or shortcuts.
+<img width="1665" height="963" alt="image" src="https://github.com/user-attachments/assets/efdc0312-ff33-4572-9dc2-366481eb9fda" />
+
+<img width="1656" height="957" alt="image" src="https://github.com/user-attachments/assets/5e27f839-c363-4e74-81bc-a69ae6503066" />
 
 常用窗口：
 
