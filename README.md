@@ -17,6 +17,10 @@ Z0BPcTools3 is a Windows user-mode debugger with an MDI-style interface. After a
 
 <img width="2223" height="1333" alt="image" src="https://github.com/user-attachments/assets/f71e15e9-97ff-4726-8e2e-e6a2f44407ff" />
 
+<img width="2232" height="1344" alt="image" src="https://github.com/user-attachments/assets/e913b069-b274-49fe-82a5-bc9e0112eb37" />
+
+<img width="2237" height="1332" alt="image" src="https://github.com/user-attachments/assets/9904b3d3-2db5-4241-879b-1e894cab5fa2" />
+
 常用窗口：
 
 Common windows:
