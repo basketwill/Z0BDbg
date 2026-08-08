@@ -4,6 +4,14 @@
 
 This document describes the main UI, shortcuts, debugging features, trace features, script system, and plugin development APIs of the Z0BPcTools3 debugger.
 
+
+## 🙏 赞助支持 / Buy Me a Coffee
+
+**中文**：如果这个项目对你有帮助，欢迎扫码打赏，支持作者继续维护和更新 🚀  
+**English**：If this project helps you, consider buying me a coffee. Your support keeps me going!
+<img width="888" height="426" alt="image" src="https://github.com/user-attachments/assets/be651118-ce30-42c2-9c0d-7e73944d8c3a" />
+
+
 ## 1. 基本概念 / Basic Concepts
 
 Z0BPcTools3 是一个 Windows 用户态调试器，界面采用多文档窗口结构。调试会话打开后，可以通过菜单或快捷键打开 CPU、内存、堆栈、模块、线程、断点、补丁、调用栈、句柄、窗口、SEH 链、引用、源代码等窗口。
