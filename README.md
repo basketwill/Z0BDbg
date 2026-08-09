@@ -584,12 +584,6 @@ Notes:
 
 Menu location:
 
-```text
-插件 -> MCP Tools -> 设置 MCP Server
-插件 -> MCP Tools -> 重新读取配置
-插件 -> MCP Tools -> 显示配置文件路径
-插件 -> MCP Tools -> 发送测试事件
-插件 -> MCP Tools -> 关于
 
 Plugin -> MCP Tools -> Configure MCP Server
 Plugin -> MCP Tools -> Reload configuration
