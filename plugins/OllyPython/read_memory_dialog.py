@@ -24,6 +24,7 @@ def hex_dump(data, base):
     return "\r\n".join(lines)
 
 
+
 def main():
     address_text = z0dbg.input_text("Read memory", "Address, for example 0x00007FF600001000:", "0x401000")
     if not address_text:
