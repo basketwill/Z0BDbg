@@ -449,9 +449,7 @@ Lua DLL search locations:
 ```text
 plugins\lua55.dll
 lua\lua55.dll
-程序目录\lua55.dll
-当前目录\lua55.dll
-PATH 中的 lua55.dll
+
 ```
 
 Recommended directory layout:
