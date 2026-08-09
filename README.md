@@ -779,10 +779,3 @@ http://www.nt5core.com
 ## 13. Notes
 
 This document is based on the current project menus, shortcuts, script help, and SDK APIs. When new menus, shortcuts, script APIs, or plugin APIs are added, update this document and the built-in `Help -> Help Contents` dialog together.
-
-
----
-
-
-本文档根据当前工程菜单、快捷键、脚本帮助和 SDK 接口整理。后续如果增加新的菜单、快捷键、脚本 API 或插件 API，应同步更新本文档和“帮助 -> 帮助内容”中的内置说明。
-
