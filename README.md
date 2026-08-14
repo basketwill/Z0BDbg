@@ -11,11 +11,8 @@ If this project helps you, consider buying me a coffee. Your support keeps me go
 -------------------------------------------------------------------------------------
 ## paypal account：
      zerobuffer@qq.com
-  ## first name:           
-                 JUN
-  ## last name : 
-                 WAN
-
+  ## first name:    JUN
+  ## last name : WAN
 --------------------------------------------------------------------------------------
 ## alipay and wechat
 
