@@ -9,12 +9,15 @@ This document describes the main UI, shortcuts, debugging features, trace featur
   
 If this project helps you, consider buying me a coffee. Your support keeps me going!
 -------------------------------------------------------------------------------------
-paypal account：
-        zerobuffer@qq.com
-  name: wan jun
+## paypal account：
+     zerobuffer@qq.com
+  ## first name:           
+                 JUN
+  ## last name : 
+                 WAN
 
 --------------------------------------------------------------------------------------
-alipay and wechat
+## alipay and wechat
 
 <img width="888" height="426" alt="image" src="https://github.com/user-attachments/assets/be651118-ce30-42c2-9c0d-7e73944d8c3a" />
 
