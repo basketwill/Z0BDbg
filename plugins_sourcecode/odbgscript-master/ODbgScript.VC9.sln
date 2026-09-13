@@ -1,0 +1,31 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 16
+VisualStudioVersion = 16.0.36631.11
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ODbgScript", "ODbgScript.vcxproj", "{E70561A4-6B5D-4044-99AE-91BAE1975AB6}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		ReleaseWDK|Win32 = ReleaseWDK|Win32
+		ReleaseWDK|x64 = ReleaseWDK|x64
+		ToDebug|Win32 = ToDebug|Win32
+		ToDebug|x64 = ToDebug|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{E70561A4-6B5D-4044-99AE-91BAE1975AB6}.ReleaseWDK|Win32.ActiveCfg = ReleaseWDK|Win32
+		{E70561A4-6B5D-4044-99AE-91BAE1975AB6}.ReleaseWDK|Win32.Build.0 = ReleaseWDK|Win32
+		{E70561A4-6B5D-4044-99AE-91BAE1975AB6}.ReleaseWDK|x64.ActiveCfg = ReleaseWDK|x64
+		{E70561A4-6B5D-4044-99AE-91BAE1975AB6}.ReleaseWDK|x64.Build.0 = ReleaseWDK|x64
+		{E70561A4-6B5D-4044-99AE-91BAE1975AB6}.ToDebug|Win32.ActiveCfg = ToDebug|Win32
+		{E70561A4-6B5D-4044-99AE-91BAE1975AB6}.ToDebug|Win32.Build.0 = ToDebug|Win32
+		{E70561A4-6B5D-4044-99AE-91BAE1975AB6}.ToDebug|x64.ActiveCfg = ToDebug|x64
+		{E70561A4-6B5D-4044-99AE-91BAE1975AB6}.ToDebug|x64.Build.0 = ToDebug|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {F6418799-4855-471B-B90D-AD525B63DACB}
+	EndGlobalSection
+EndGlobal

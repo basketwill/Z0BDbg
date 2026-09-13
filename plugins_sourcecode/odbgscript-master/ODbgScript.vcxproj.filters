@@ -1,0 +1,132 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{61a600c3-c156-47b6-aef2-c7f1b8514a5e}</UniqueIdentifier>
+      <Extensions>cpp;c;cxx;rc;def;r;odl;idl;hpj;bat</Extensions>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{2cd59e31-3f6f-41b1-9a2d-17e28a7eb639}</UniqueIdentifier>
+      <Extensions>h;hpp;hxx;hm;inl</Extensions>
+    </Filter>
+    <Filter Include="Source Included">
+      <UniqueIdentifier>{19110e7c-4ec5-4ba8-807f-0bfb71ee2e9b}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Resource Files">
+      <UniqueIdentifier>{323b2583-b996-4644-8102-864592910984}</UniqueIdentifier>
+      <Extensions>ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe</Extensions>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="guicon.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="HelperFunctions.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ODbgScript.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="OllyLang.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Dialogs.cpp">
+      <Filter>Source Included</Filter>
+    </ClCompile>
+    <ClCompile Include="LogWindows.cpp">
+      <Filter>Source Included</Filter>
+    </ClCompile>
+    <ClCompile Include="mru.cpp">
+      <Filter>Source Included</Filter>
+    </ClCompile>
+    <ClCompile Include="OllyLangCommands.cpp">
+      <Filter>Source Included</Filter>
+    </ClCompile>
+    <ClCompile Include="Progress.cpp">
+      <Filter>Source Included</Filter>
+    </ClCompile>
+    <ClCompile Include="Search.cpp">
+      <Filter>Source Included</Filter>
+    </ClCompile>
+    <ClCompile Include="var.cpp">
+      <Filter>Source Included</Filter>
+    </ClCompile>
+    <ClCompile Include="ODBgScriptHostApi.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="ODbgScript.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="OllyLang.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Plugin201.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="log.ico">
+      <Filter>Resource Files</Filter>
+    </None>
+    <None Include="script.ico">
+      <Filter>Resource Files</Filter>
+    </None>
+    <None Include="copy.bat">
+      <Filter>Source Files</Filter>
+    </None>
+    <None Include="copydbg.bat">
+      <Filter>Source Files</Filter>
+    </None>
+    <None Include="doc\ODbgScript.txt" />
+    <None Include="doc\Plugins.chm" />
+    <None Include="doc\sample.osc" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="ODbgScript.rc">
+      <Filter>Resource Files</Filter>
+    </ResourceCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <CustomBuild Include="dumper.h">
+      <Filter>Header Files</Filter>
+    </CustomBuild>
+    <CustomBuild Include="guicon.h">
+      <Filter>Header Files</Filter>
+    </CustomBuild>
+    <CustomBuild Include="HelperFunctions.h">
+      <Filter>Header Files</Filter>
+    </CustomBuild>
+    <CustomBuild Include="IniReader.h">
+      <Filter>Header Files</Filter>
+    </CustomBuild>
+    <CustomBuild Include="Progress.h">
+      <Filter>Header Files</Filter>
+    </CustomBuild>
+    <CustomBuild Include="StdAfx.h">
+      <Filter>Header Files</Filter>
+    </CustomBuild>
+    <CustomBuild Include="LogWindows.h">
+      <Filter>Source Included</Filter>
+    </CustomBuild>
+    <CustomBuild Include="mru.h">
+      <Filter>Source Included</Filter>
+    </CustomBuild>
+    <CustomBuild Include="Search.h">
+      <Filter>Source Included</Filter>
+    </CustomBuild>
+    <CustomBuild Include="var.h">
+      <Filter>Source Included</Filter>
+    </CustomBuild>
+    <CustomBuild Include="ollydbg201.def">
+      <Filter>Resource Files</Filter>
+    </CustomBuild>
+    <CustomBuild Include="resource.h">
+      <Filter>Resource Files</Filter>
+    </CustomBuild>
+    <CustomBuild Include="version.h">
+      <Filter>Resource Files</Filter>
+    </CustomBuild>
+  </ItemGroup>
+</Project>
