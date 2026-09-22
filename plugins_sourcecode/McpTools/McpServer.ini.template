@@ -1,0 +1,22 @@
+[server]
+name=Z0BDbg MCP Server
+version=1.0
+protocol_version=2024-11-05
+
+[http]
+bind=127.0.0.1
+port=8765
+auth_token=
+auto_start=1
+
+[remote]
+url=https://example.com/mcp
+transport=streamable-http
+token=
+headers=
+auto_connect=0
+auto_reconnect=1
+retry_interval_ms=3000
+max_retries=0
+timeout_ms=30000
+verify_tls=1
