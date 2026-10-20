@@ -698,7 +698,7 @@ Current MCP control tools:
 | Software breakpoints | `set_software_breakpoint`, `set_software_breakpoint_ext`, `delete_software_breakpoint`, `delete_breakpoint_range`, `delete_all_breakpoints` |
 | Memory breakpoints | `set_memory_breakpoint`, `delete_memory_breakpoint` |
 | Hardware breakpoints | `set_hardware_breakpoint`, `delete_hardware_breakpoint`, `get_breakpoint_type`, `get_breakpoint_type_count`, `get_next_breakpoint`, `set_temp_breakpoint`, `plugin_temp_breakpoint` |
-| Disassembly and assembly | `disassemble`, `assemble` |
+| Disassembly and assembly | `disassemble`, `disassemble_range`, `ai_brief`, `assemble` |
 | CPU window | `set_cpu`, `set_disasm` |
 | Expressions, symbols, modules, and threads | `evaluate`, `find_name`, `insert_name`, `decode_address`, `decode_name`, `comment_address`, `simple_address`, `find_label`, `find_module`, `find_thread`, `find_data`, `find_decode`, `find_strings`, `find_references`, `find_import_by_name`, `find_file_offset`, `follow_call`, `walk_reference`, `walk_reference_ex`, `is_prefix` |
 | CPU context | `get_last_error`, `get_cpu_disasm_dump`, `get_cpu_disasm_table` |
@@ -708,7 +708,11 @@ Current MCP control tools:
 | Trace settings | `set_trace_condition`, `set_trace_count`, `set_trace_pause_on_commands` |
 | Dump and plugin notification helpers | `set_dump_type`, `dump_backup`, `plugin_module_changed` |
 
-Total: 81 control tools. Address parameters support 64-bit addresses; `"0x..."` JSON strings are recommended. In x64 builds, disassembly and assembly use the debugger's x64 instruction decoding/assembling path. In x64 mode, host APIs returning pointers through `int` are not exposed as control tools to avoid truncating 64-bit values.
+Total: 83 control tools. Address parameters support 64-bit addresses; `"0x..."` JSON strings are recommended. In x64 builds, disassembly and assembly use the debugger's x64 instruction decoding/assembling path. In x64 mode, host APIs returning pointers through `int` are not exposed as control tools to avoid truncating 64-bit values.
+
+`disassemble` and `disassemble_range` return plain, ANSI-free text by default, so their output can be passed directly to an AI model. Pass `structured: true` to get per-instruction objects (`address`, `size`, `bytes`, `text`, `comment`, `target`), or `raw: true` to get instruction text only. `ai_brief` returns a compact Markdown summary with status, thread, IP, registers, stack, and a disassembly window at IP.
+
+Tool list entries include input schemas for the core read/write, breakpoint, disassembly, and AI tools. Tools are called through the standard `tools/call` method; the legacy `z0dbg.call` form remains supported.
 
 Register write, thread enumeration/per-thread suspend/resume, module enumeration, detailed patch management, and more APIs can be added later to approach xdbg64 MCP's 79-tool scale.
 
@@ -732,7 +736,19 @@ The tool name can also be placed directly after `method`:
 {"jsonrpc":"2.0","id":3,"method":"z0dbg.step_over"}
 ```
 
-The current version supports MCP Server configuration, test events, structured debug event forwarding, notification forwarding, and the first 81 debugger control tools.
+Standard MCP tool call with structured disassembly:
+
+```json
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"disassemble_range","arguments":{"start":"0x401000","end":"0x401080","structured":true}}}
+```
+
+One-call AI triage brief:
+
+```json
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"ai_brief","arguments":{"disasm_count":12,"stack_bytes":32}}}
+```
+
+The current version supports MCP Server configuration, test events, structured debug event forwarding, notification forwarding, and 83 debugger control tools.
 
 ## 10. Common Tasks
 

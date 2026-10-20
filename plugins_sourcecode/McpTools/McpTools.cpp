@@ -2447,6 +2447,36 @@ static bool JsonFindUInt64(const std::string& json, const char* key, unsigned __
     return end && end != num.c_str();
 }
 
+static bool JsonFindBool(const std::string& json, const char* key, bool& value)
+{
+    std::string pattern = "\"";
+    pattern += key;
+    pattern += "\"";
+    size_t p = json.find(pattern);
+    if (p == std::string::npos)
+        return false;
+    p = json.find(':', p + pattern.size());
+    if (p == std::string::npos)
+        return false;
+    ++p;
+    while (p < json.size() && (json[p] == ' ' || json[p] == '\t' || json[p] == '\r' || json[p] == '\n'))
+        ++p;
+    if (json.compare(p, 4, "true") == 0) {
+        value = true;
+        return true;
+    }
+    if (json.compare(p, 5, "false") == 0) {
+        value = false;
+        return true;
+    }
+    unsigned __int64 number = 0;
+    if (JsonFindUInt64(json, key, number)) {
+        value = number != 0;
+        return true;
+    }
+    return false;
+}
+
 static std::wstring Utf8ToWide(const std::string& text)
 {
     if (text.empty())
@@ -2512,6 +2542,395 @@ static ulong BreakAccessFromText(const std::string& access, ulong def)
     return def;
 }
 
+struct DisasmLine {
+    unsigned __int64 address;
+    unsigned int size;
+    std::string bytes;
+    std::string text;
+    std::string comment;
+    unsigned __int64 target;
+};
+
+static bool DecodeInstruction(unsigned __int64 address, DisasmLine& line)
+{
+    if (!pReadmemory || !pDisasm)
+        return false;
+    uchar cmd[16] = { 0 };
+    ulong read = pReadmemory(cmd, (ulong)address, sizeof(cmd), MM_SILENT);
+    if (!read)
+        return false;
+    t_disasm da;
+    ZeroMemory(&da, sizeof(da));
+    ulong len = pDisasm(cmd, read, (ulong)address, NULL, &da, 0, NULL, NULL);
+    if (!len || len > read)
+        return false;
+    line.address = address;
+    line.size = (unsigned int)len;
+    line.bytes = da.dump[0] ? WideToUtf8(da.dump) : BytesToHex(cmd, len);
+    line.text = WideToUtf8(da.result);
+    line.comment = WideToUtf8(da.comment);
+    line.target = (unsigned __int64)da.jmpaddr;
+    return true;
+}
+
+static std::string FormatDisasmAddress(unsigned __int64 address)
+{
+    char buf[32];
+    StringCchPrintfA(buf, _countof(buf), "%08llX", address);
+    return std::string(buf);
+}
+
+static std::string FormatDisasmLine(const DisasmLine& line)
+{
+    std::string out = FormatDisasmAddress(line.address);
+    out += "  ";
+    std::string bytes = line.bytes;
+    if (bytes.size() < 20)
+        bytes.append(20 - bytes.size(), ' ');
+    out += bytes;
+    out += "  ";
+    out += line.text;
+    if (!line.comment.empty()) {
+        out += "  ; ";
+        out += line.comment;
+    }
+    out += "\n";
+    return out;
+}
+
+static std::vector<DisasmLine> CollectDisasm(unsigned __int64 start, unsigned __int64 count, unsigned __int64 end)
+{
+    std::vector<DisasmLine> lines;
+    if (!count)
+        count = 1;
+    if (count > 256)
+        count = 256;
+    unsigned __int64 pc = start;
+    for (unsigned __int64 i = 0; i < count; ++i) {
+        if (end && pc >= end)
+            break;
+        DisasmLine line;
+        if (!DecodeInstruction(pc, line))
+            break;
+        lines.push_back(line);
+        if (!line.size)
+            break;
+        pc += line.size;
+        if (pc < start)
+            break;
+    }
+    return lines;
+}
+
+static std::string BuildDisasmResult(
+    unsigned __int64 start,
+    unsigned __int64 count,
+    unsigned __int64 end,
+    bool structured,
+    bool raw)
+{
+    std::vector<DisasmLine> lines = CollectDisasm(start, count, end);
+    std::string text;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (raw)
+            text += lines[i].text + "\n";
+        else
+            text += FormatDisasmLine(lines[i]);
+    }
+
+    char num[32];
+    std::string out = "{\"ok\":true,\"start\":";
+    JsonAppendHex64(out, start);
+    out += ",\"count\":";
+    StringCchPrintfA(num, _countof(num), "%llu", (unsigned long long)lines.size());
+    out += num;
+    if (!lines.empty()) {
+        out += ",\"size\":";
+        StringCchPrintfA(num, _countof(num), "%u", lines[0].size);
+        out += num;
+        out += ",\"dump\":";
+        JsonAppendEscaped(out, lines[0].bytes.c_str());
+    }
+    out += ",\"text\":";
+    JsonAppendEscaped(out, text.c_str());
+    if (structured) {
+        out += ",\"instructions\":[";
+        for (size_t i = 0; i < lines.size(); ++i) {
+            if (i)
+                out += ",";
+            const DisasmLine& line = lines[i];
+            out += "{\"address\":";
+            JsonAppendHex64(out, line.address);
+            out += ",\"size\":";
+            StringCchPrintfA(num, _countof(num), "%u", line.size);
+            out += num;
+            out += ",\"bytes\":";
+            JsonAppendEscaped(out, line.bytes.c_str());
+            out += ",\"text\":";
+            JsonAppendEscaped(out, line.text.c_str());
+            if (!line.comment.empty()) {
+                out += ",\"comment\":";
+                JsonAppendEscaped(out, line.comment.c_str());
+            }
+            if (line.target) {
+                out += ",\"target\":";
+                JsonAppendHex64(out, line.target);
+            }
+            out += "}";
+        }
+        out += "]";
+    }
+    out += "}";
+    return out;
+}
+
+static bool EvalUInt64Value(const char* expression, unsigned __int64& value)
+{
+    if (!pExpressionA || !pGetcputhreadid)
+        return false;
+    Z0B_RESULT res;
+    ZeroMemory(&res, sizeof(res));
+    int ok = pExpressionA(&res, (char*)expression, 0, 0, NULL, 0, 0, pGetcputhreadid());
+    if (!ok)
+        return false;
+    value = *(unsigned __int64*)res.data;
+    return true;
+}
+
+static const char* StatusName(int status)
+{
+    switch (status) {
+    case STAT_IDLE: return "idle";
+    case STAT_LOADING: return "loading";
+    case STAT_ATTACHING: return "attaching";
+    case STAT_RUNNING: return "running";
+    case STAT_RUNTHR: return "running-thread";
+    case STAT_STEPIN: return "step-in";
+    case STAT_STEPOVER: return "step-over";
+    case STAT_ANIMIN: return "animate-in";
+    case STAT_ANIMOVER: return "animate-over";
+    case STAT_TRACEIN: return "trace-in";
+    case STAT_TRACEOVER: return "trace-over";
+    case STAT_SFXRUN: return "sfx-run";
+    case STAT_SFXHIT: return "sfx-hit";
+    case STAT_SFXKNOWN: return "sfx-known";
+    case STAT_TILLRET: return "until-return";
+    case STAT_OVERRET: return "over-return";
+    case STAT_TILLUSER: return "until-user";
+    case STAT_PAUSING: return "pausing";
+    case STAT_PAUSED: return "paused";
+    case STAT_FINISHED: return "finished";
+    case STAT_CLOSING: return "closing";
+    default: return "unknown";
+    }
+}
+
+static std::string FormatStackBytes(const unsigned char* data, size_t size, unsigned __int64 base)
+{
+    std::string out;
+    for (size_t off = 0; off < size; off += 16) {
+        std::string hex;
+        std::string ascii;
+        for (size_t i = 0; i < 16; ++i) {
+            if (off + i < size) {
+                char b[8];
+                StringCchPrintfA(b, _countof(b), "%02X ", data[off + i]);
+                hex += b;
+                unsigned char c = data[off + i];
+                ascii.push_back(c >= 0x20 && c < 0x7F ? (char)c : '.');
+            }
+            else {
+                hex += "   ";
+                ascii.push_back(' ');
+            }
+        }
+        out += FormatDisasmAddress(base + off);
+        out += "  ";
+        out += hex;
+        out += " ";
+        out += ascii;
+        out += "\n";
+    }
+    return out;
+}
+
+static std::string BuildAiBrief(unsigned __int64 disasm_count, unsigned __int64 stack_bytes)
+{
+    if (!disasm_count)
+        disasm_count = 10;
+    if (disasm_count > 64)
+        disasm_count = 64;
+    if (!stack_bytes)
+        stack_bytes = 32;
+    if (stack_bytes > 256)
+        stack_bytes = 256;
+
+    int status = pGetstatus ? pGetstatus() : -1;
+    unsigned __int64 ip = 0, esp = 0;
+    bool have_ip = EvalUInt64Value("EIP", ip);
+    if (!have_ip && pGetcpudisasmdump) {
+        t_dump* dump = pGetcpudisasmdump();
+        if (dump)
+            ip = dump->sel0 ? dump->sel0 : dump->addr;
+    }
+    EvalUInt64Value("ESP", esp);
+    unsigned __int64 thread_id = pGetcputhreadid ? pGetcputhreadid() : 0;
+    Z0B_MODULE* mod = (pFindmodule && ip) ? pFindmodule((ulong)ip) : NULL;
+
+    std::string md = "# Z0BDbg AI Brief\n\n";
+    md += "- status: `";
+    md += StatusName(status);
+    md += "` (";
+    char num[64];
+    StringCchPrintfA(num, _countof(num), "%d", status);
+    md += num;
+    md += ")\n";
+    md += "- thread: `";
+    StringCchPrintfA(num, _countof(num), "0x%llX", (unsigned long long)thread_id);
+    md += num;
+    md += "`\n";
+    md += "- ip: `";
+    StringCchPrintfA(num, _countof(num), "0x%llX", (unsigned long long)ip);
+    md += num;
+    md += "`";
+    if (mod) {
+        md += " in `";
+        md += mod->name[0] ? mod->name : "<module>";
+        md += "`";
+        if (mod->base) {
+            StringCchPrintfA(num, _countof(num), " + 0x%llX", (unsigned long long)(ip - mod->base));
+            md += num;
+        }
+    }
+    md += "\n";
+
+    char symbol[TEXTLEN] = { 0 };
+    char comment[TEXTLEN] = { 0 };
+    if (pDecodeaddressA && ip &&
+        pDecodeaddressA((ulong)ip, 0, 0, symbol, TEXTLEN, comment) &&
+        symbol[0]) {
+        md += "- symbol: `";
+        md += symbol;
+        md += "`";
+        if (comment[0]) {
+            md += " — ";
+            md += comment;
+        }
+        md += "\n";
+    }
+
+    md += "\n## Registers\n\n| Register | Value |\n|---|---|\n";
+    const char* reg_names[] = { "EIP", "ESP", "EBP", "EAX", "EBX", "ECX", "EDX", "ESI", "EDI" };
+    for (size_t i = 0; i < _countof(reg_names); ++i) {
+        unsigned __int64 value = 0;
+        md += "| ";
+        md += reg_names[i];
+        md += " | ";
+        if (EvalUInt64Value(reg_names[i], value)) {
+            StringCchPrintfA(num, _countof(num), "0x%08llX", (unsigned long long)value);
+            md += num;
+        }
+        else {
+            md += "n/a";
+        }
+        md += " |\n";
+    }
+
+    md += "\n## Stack\n```text\n";
+    if (pReadmemory && esp) {
+        unsigned char stack[256];
+        ZeroMemory(stack, sizeof(stack));
+        ulong got = pReadmemory(stack, (ulong)esp, (ulong)stack_bytes, MM_SILENT);
+        if (got)
+            md += FormatStackBytes(stack, (size_t)got, esp);
+        else
+            md += "<stack is not readable>\n";
+    }
+    else {
+        md += "<stack pointer is not available>\n";
+    }
+    md += "```\n";
+
+    md += "\n## Disassembly at IP\n```asm\n";
+    if (ip) {
+        std::vector<DisasmLine> lines = CollectDisasm(ip, disasm_count, 0);
+        if (lines.empty())
+            md += "<no instruction decoded>\n";
+        for (size_t i = 0; i < lines.size(); ++i)
+            md += FormatDisasmLine(lines[i]);
+    }
+    else {
+        md += "<instruction pointer is not available>\n";
+    }
+    md += "```\n";
+    md += "\n> Generated locally by Z0BDbg MCP Tools. No debugger data left the machine.\n";
+
+    std::string result = "{\"ok\":true,\"text\":";
+    JsonAppendEscaped(result, md.c_str());
+    result += ",\"ip\":";
+    JsonAppendHex64(result, ip);
+    result += ",\"thread\":";
+    JsonAppendHex64(result, thread_id);
+    result += ",\"status\":";
+    JsonAppendEscaped(result, StatusName(status));
+    result += "}";
+    return result;
+}
+
+static std::string ToolDescription(const char* tool)
+{
+    std::string name(tool);
+    if (name == "disassemble")
+        return "Disassemble one or more instructions at address. Returns plain text by default; set structured=true for instruction objects and raw=true for instruction text only.";
+    if (name == "disassemble_range")
+        return "Disassemble a range [start, end) or a fixed count. Returns plain text by default; set structured=true for instruction objects.";
+    if (name == "ai_brief")
+        return "Build a compact Markdown brief for AI triage: status, IP, registers, stack, and disassembly at IP.";
+    if (name == "read_memory")
+        return "Read process memory at address and return hex bytes.";
+    if (name == "write_memory")
+        return "Write hex bytes to process memory at address.";
+    if (name == "find_memory")
+        return "Find a byte pattern in a memory range.";
+    if (name == "evaluate")
+        return "Evaluate a debugger expression and return its value.";
+    if (name == "set_software_breakpoint")
+        return "Set a software breakpoint at address.";
+    if (name == "set_memory_breakpoint")
+        return "Set a memory breakpoint at address with size and access type.";
+    if (name == "assemble")
+        return "Assemble one instruction at address and return the encoded bytes.";
+    if (name == "get_status")
+        return "Return the current debugger status.";
+    return "Z0BDbg debugger tool: " + name;
+}
+
+static std::string ToolSchemaFor(const char* tool)
+{
+    std::string name(tool);
+    if (name == "disassemble")
+        return "{\"type\":\"object\",\"properties\":{\"address\":{\"type\":[\"string\",\"integer\"],\"description\":\"Start address (hex or decimal)\"},\"count\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":256},\"end\":{\"type\":[\"string\",\"integer\"]},\"structured\":{\"type\":\"boolean\"},\"raw\":{\"type\":\"boolean\"}}}";
+    if (name == "disassemble_range")
+        return "{\"type\":\"object\",\"properties\":{\"start\":{\"type\":[\"string\",\"integer\"]},\"end\":{\"type\":[\"string\",\"integer\"]},\"count\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":256},\"structured\":{\"type\":\"boolean\"}}}";
+    if (name == "ai_brief")
+        return "{\"type\":\"object\",\"properties\":{\"disasm_count\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":64},\"stack_bytes\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":256}}}";
+    if (name == "read_memory")
+        return "{\"type\":\"object\",\"properties\":{\"address\":{\"type\":[\"string\",\"integer\"]},\"size\":{\"type\":\"integer\",\"minimum\":1}},\"required\":[\"address\",\"size\"]}";
+    if (name == "write_memory")
+        return "{\"type\":\"object\",\"properties\":{\"address\":{\"type\":[\"string\",\"integer\"]},\"data\":{\"type\":\"string\",\"description\":\"Hex bytes\"}},\"required\":[\"address\",\"data\"]}";
+    if (name == "find_memory")
+        return "{\"type\":\"object\",\"properties\":{\"address\":{\"type\":[\"string\",\"integer\"]},\"size\":{\"type\":\"integer\"},\"hex\":{\"type\":\"string\"}}}";
+    if (name == "evaluate")
+        return "{\"type\":\"object\",\"properties\":{\"expression\":{\"type\":\"string\"}},\"required\":[\"expression\"]}";
+    if (name == "set_software_breakpoint")
+        return "{\"type\":\"object\",\"properties\":{\"address\":{\"type\":[\"string\",\"integer\"]}},\"required\":[\"address\"]}";
+    if (name == "set_memory_breakpoint")
+        return "{\"type\":\"object\",\"properties\":{\"address\":{\"type\":[\"string\",\"integer\"]},\"size\":{\"type\":\"integer\"},\"access\":{\"type\":\"string\",\"enum\":[\"read\",\"write\",\"execute\",\"readwrite\"]}}}";
+    if (name == "assemble")
+        return "{\"type\":\"object\",\"properties\":{\"address\":{\"type\":[\"string\",\"integer\"]},\"text\":{\"type\":\"string\"}},\"required\":[\"address\",\"text\"]}";
+    return "{\"type\":\"object\",\"properties\":{}}";
+}
+
 static std::string ToolListJson(void)
 {
     const char* tools[] = {
@@ -2523,7 +2942,7 @@ static std::string ToolListJson(void)
         "set_hardware_breakpoint", "delete_hardware_breakpoint",
         "get_breakpoint_type", "get_breakpoint_type_count", "get_next_breakpoint", "set_temp_breakpoint",
         "plugin_temp_breakpoint",
-        "disassemble", "assemble", "set_cpu", "set_disasm",
+        "disassemble", "disassemble_range", "ai_brief", "assemble", "set_cpu", "set_disasm",
         "evaluate", "find_name", "insert_name", "decode_address", "decode_name", "comment_address", "simple_address", "find_label", "find_module", "find_thread", "find_data", "find_decode", "find_strings", "find_references", "find_import_by_name", "find_file_offset", "follow_call", "walk_reference", "walk_reference_ex", "is_prefix",
         "get_last_error", "get_cpu_disasm_dump", "get_cpu_disasm_table",
         "plugin_read_ini_int", "plugin_write_ini_int", "plugin_read_ini_string", "plugin_write_ini_string",
@@ -2539,11 +2958,12 @@ static std::string ToolListJson(void)
             out += ",";
         out += "{\"name\":";
         JsonAppendEscaped(out, tools[i]);
-        std::string description = "Z0BDbg debugger tool: ";
-        description += tools[i];
+        std::string description = ToolDescription(tools[i]);
         out += ",\"description\":";
         JsonAppendEscaped(out, description.c_str());
-        out += ",\"inputSchema\":{\"type\":\"object\"}}";
+        out += ",\"inputSchema\":";
+        out += ToolSchemaFor(tools[i]);
+        out += "}";
     }
     out += "]";
     return out;
@@ -2615,6 +3035,7 @@ static bool IsReadTool(const std::string& tool)
         tool == "find_memory" || tool == "find_data_ptr" ||
         tool == "get_breakpoint_type" || tool == "get_breakpoint_type_count" ||
         tool == "get_next_breakpoint" || tool == "disassemble" ||
+        tool == "disassemble_range" || tool == "ai_brief" ||
         tool == "evaluate" || tool == "find_name" || tool == "decode_address" ||
         tool == "decode_name" || tool == "simple_address" || tool == "find_label" ||
         tool == "find_module" || tool == "find_thread" || tool == "find_data" ||
@@ -2774,6 +3195,8 @@ static std::string ExecuteToolCommand(const std::string& json)
         return JsonRpcError(id, -32003, "tool is disabled by MCP Tools permissions");
 
     unsigned __int64 address = 0, size = 0, index = 0, type_value = 0, count = 0;
+    unsigned __int64 range_start = 0, range_end = 0, disasm_count = 0, stack_bytes = 0;
+    bool structured = false, raw = false;
     std::string access, hex, text, name, expression, condition, cmdset, key, value, defvalue;
     JsonFindUInt64(json, "address", address);
     JsonFindUInt64(json, "addr", address);
@@ -2781,6 +3204,12 @@ static std::string ExecuteToolCommand(const std::string& json)
     JsonFindUInt64(json, "index", index);
     JsonFindUInt64(json, "type", type_value);
     JsonFindUInt64(json, "count", count);
+    JsonFindUInt64(json, "start", range_start);
+    JsonFindUInt64(json, "end", range_end);
+    JsonFindUInt64(json, "disasm_count", disasm_count);
+    JsonFindUInt64(json, "stack_bytes", stack_bytes);
+    JsonFindBool(json, "structured", structured);
+    JsonFindBool(json, "raw", raw);
     JsonFindString(json, "access", access);
     JsonFindString(json, "hex", hex);
     JsonFindString(json, "data", hex);
@@ -3051,25 +3480,43 @@ static std::string ExecuteToolCommand(const std::string& json)
         rc = pPlugintempbreakpoint((ulong)address, (int)type_value, (int)BreakAccessFromText(access, BP_EXEC), (int)size, 1);
     }
     else if (tool == "disassemble") {
-        uchar cmd[32] = { 0 };
         if (!pReadmemory || !pDisasm)
             return JsonRpcError(id, -32001, "Disasm is not available");
-        ulong read = pReadmemory(cmd, (ulong)address, sizeof(cmd), MM_SILENT);
-        if (!read)
-            return JsonRpcError(id, -32000, "failed to read instruction bytes");
-        t_disasm da;
-        ZeroMemory(&da, sizeof(da));
-        ulong len = pDisasm(cmd, read, (ulong)address, NULL, &da, 0, NULL, NULL);
-        std::string result = "{\"ok\":true,\"size\":";
-        char num[32];
-        StringCchPrintfA(num, _countof(num), "%llu", (unsigned long long)len);
-        result += num;
-        result += ",\"text\":";
-        JsonAppendWide(result, da.result);
-        result += ",\"dump\":";
-        JsonAppendWide(result, da.dump);
-        result += "}";
-        return JsonRpcResult(id, result);
+        unsigned __int64 start = address;
+        if (!start && pGetcpudisasmdump) {
+            t_dump* dump = pGetcpudisasmdump();
+            if (dump)
+                start = dump->sel0 ? dump->sel0 : dump->addr;
+        }
+        if (!start)
+            return JsonRpcError(id, -32602, "disassemble requires address");
+        unsigned __int64 stop = range_end;
+        if (!stop && size)
+            stop = start + size;
+        unsigned __int64 n = count ? count : (stop ? 256 : 1);
+        return JsonRpcResult(id, BuildDisasmResult(start, n, stop, structured, raw));
+    }
+    else if (tool == "disassemble_range") {
+        if (!pReadmemory || !pDisasm)
+            return JsonRpcError(id, -32001, "Disasm is not available");
+        unsigned __int64 start = range_start ? range_start : address;
+        if (!start && pGetcpudisasmdump) {
+            t_dump* dump = pGetcpudisasmdump();
+            if (dump)
+                start = dump->sel0 ? dump->sel0 : dump->addr;
+        }
+        if (!start)
+            return JsonRpcError(id, -32602, "disassemble_range requires start");
+        unsigned __int64 stop = range_end;
+        if (!stop && size)
+            stop = start + size;
+        unsigned __int64 n = count ? count : (stop ? 256 : 64);
+        return JsonRpcResult(id, BuildDisasmResult(start, n, stop, structured, raw));
+    }
+    else if (tool == "ai_brief") {
+        unsigned __int64 n = disasm_count ? disasm_count : (count ? count : 10);
+        unsigned __int64 sb = stack_bytes ? stack_bytes : (size ? size : 32);
+        return JsonRpcResult(id, BuildAiBrief(n, sb));
     }
     else if (tool == "assemble") {
         if (text.empty())
