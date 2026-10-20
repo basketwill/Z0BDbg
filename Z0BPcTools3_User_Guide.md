@@ -698,7 +698,7 @@ Current MCP control tools:
 | Software breakpoints | `set_software_breakpoint`, `set_software_breakpoint_ext`, `delete_software_breakpoint`, `delete_breakpoint_range`, `delete_all_breakpoints` |
 | Memory breakpoints | `set_memory_breakpoint`, `delete_memory_breakpoint` |
 | Hardware breakpoints | `set_hardware_breakpoint`, `delete_hardware_breakpoint`, `get_breakpoint_type`, `get_breakpoint_type_count`, `get_next_breakpoint`, `set_temp_breakpoint`, `plugin_temp_breakpoint` |
-| Disassembly and assembly | `disassemble`, `assemble` |
+| Disassembly and assembly | `disassemble`, `disassemble_range`, `ai_brief`, `assemble` |
 | CPU window | `set_cpu`, `set_disasm` |
 | Expressions, symbols, modules, and threads | `evaluate`, `find_name`, `insert_name`, `decode_address`, `decode_name`, `comment_address`, `simple_address`, `find_label`, `find_module`, `find_thread`, `find_data`, `find_decode`, `find_strings`, `find_references`, `find_import_by_name`, `find_file_offset`, `follow_call`, `walk_reference`, `walk_reference_ex`, `is_prefix` |
 | CPU context | `get_last_error`, `get_cpu_disasm_dump`, `get_cpu_disasm_table` |
@@ -708,7 +708,11 @@ Current MCP control tools:
 | Trace settings | `set_trace_condition`, `set_trace_count`, `set_trace_pause_on_commands` |
 | Dump and plugin notification helpers | `set_dump_type`, `dump_backup`, `plugin_module_changed` |
 
-Total: 81 control tools. Address parameters support 64-bit addresses; `"0x..."` JSON strings are recommended. In x64 builds, disassembly and assembly use the debugger's x64 instruction decoding/assembling path. In x64 mode, host APIs returning pointers through `int` are not exposed as control tools to avoid truncating 64-bit values.
+Total: 83 control tools. Address parameters support 64-bit addresses; `"0x..."` JSON strings are recommended. In x64 builds, disassembly and assembly use the debugger's x64 instruction decoding/assembling path. In x64 mode, host APIs returning pointers through `int` are not exposed as control tools to avoid truncating 64-bit values.
+
+`disassemble` and `disassemble_range` return plain, ANSI-free text by default, so their output can be passed directly to an AI model. Pass `structured: true` to get per-instruction objects (`address`, `size`, `bytes`, `text`, `comment`, `target`), or `raw: true` to get instruction text only. `ai_brief` returns a compact Markdown summary with status, thread, IP, registers, stack, and a disassembly window at IP.
+
+Tool list entries include input schemas for the core read/write, breakpoint, disassembly, and AI tools. Tools are called through the standard `tools/call` method; the legacy `z0dbg.call` form remains supported.
 
 Register write, thread enumeration/per-thread suspend/resume, module enumeration, detailed patch management, and more APIs can be added later to approach xdbg64 MCP's 79-tool scale.
 
@@ -732,7 +736,7 @@ The tool name can also be placed directly after `method`:
 {"jsonrpc":"2.0","id":3,"method":"z0dbg.step_over"}
 ```
 
-The current version supports MCP Server configuration, test events, structured debug event forwarding, notification forwarding, and the first 81 debugger control tools.
+The current version supports MCP Server configuration, test events, structured debug event forwarding, notification forwarding, and 83 debugger control tools.
 
 ## 10. Common Tasks
 
@@ -1473,7 +1477,7 @@ MCP Tools 插件界面语言跟随主菜单“中文 / English”的当前选择
 | `dataPointer` | 原始 data 指针地址，供高级 server 侧解析。 |
 | `parm1`、`parm2` | 通知参数，通常是地址或范围值。 |
 
-当前版本已完成 MCP Server 配置、测试事件、调试事件和通知事件的结构化转发。后续可继续增加 MCP 标准工具枚举、工具调用和调试器 API 反向控制。
+当前版本已完成 MCP Server 配置、测试事件、调试事件和通知事件的结构化转发，并提供 MCP 标准工具枚举、工具调用和调试器 API 反向控制。
 
 当前 MCP 控制工具：
 
@@ -1485,7 +1489,7 @@ MCP Tools 插件界面语言跟随主菜单“中文 / English”的当前选择
 | 软件断点 | `set_software_breakpoint`, `set_software_breakpoint_ext`, `delete_software_breakpoint`, `delete_breakpoint_range`, `delete_all_breakpoints` |
 | 内存断点 | `set_memory_breakpoint`, `delete_memory_breakpoint` |
 | 硬件断点 | `set_hardware_breakpoint`, `delete_hardware_breakpoint`, `get_breakpoint_type`, `get_breakpoint_type_count`, `get_next_breakpoint`, `set_temp_breakpoint`, `plugin_temp_breakpoint` |
-| 反汇编与汇编 | `disassemble`, `assemble` |
+| 反汇编与汇编 | `disassemble`, `disassemble_range`, `ai_brief`, `assemble` |
 | CPU 窗口 | `set_cpu`, `set_disasm` |
 | 表达式、符号、模块与线程 | `evaluate`, `find_name`, `insert_name`, `decode_address`, `decode_name`, `comment_address`, `simple_address`, `find_label`, `find_module`, `find_thread`, `find_data`, `find_decode`, `find_strings`, `find_references`, `find_import_by_name`, `find_file_offset`, `follow_call`, `walk_reference`, `walk_reference_ex`, `is_prefix` |
 | CPU 上下文 | `get_last_error`, `get_cpu_disasm_dump`, `get_cpu_disasm_table` |
@@ -1495,9 +1499,13 @@ MCP Tools 插件界面语言跟随主菜单“中文 / English”的当前选择
 | 跟踪设置 | `set_trace_condition`, `set_trace_count`, `set_trace_pause_on_commands` |
 | Dump 与插件通知辅助 | `set_dump_type`, `dump_backup`, `plugin_module_changed` |
 
-合计：81 个控制工具。地址参数统一支持 64 位地址，JSON 中建议使用 `"0x..."` 字符串；反汇编/汇编在 x64 构建下使用当前调试器的 x64 指令解码/汇编能力。x64 下不会通过返回 `int` 的宿主接口暴露进程基址或句柄，避免 64 位值被截断。
+合计：83 个控制工具。地址参数统一支持 64 位地址，JSON 中建议使用 `"0x..."` 字符串；反汇编/汇编在 x64 构建下使用当前调试器的 x64 指令解码/汇编能力。x64 下不会通过返回 `int` 的宿主接口暴露进程基址或句柄，避免 64 位值被截断。
 
-寄存器写入、线程枚举/单线程挂起恢复、模块枚举、补丁详细管理等接口后续可以继续补齐，向 xdbg64 MCP 的 79 个工具规模扩展。
+`disassemble` 和 `disassemble_range` 默认返回无 ANSI 颜色的纯文本，可直接交给 AI 模型；传入 `structured: true` 可返回逐条指令对象（`address`、`size`、`bytes`、`text`、`comment`、`target`），传入 `raw: true` 则只返回指令文本。`ai_brief` 返回一段 Markdown 摘要，包含状态、线程、IP、寄存器、栈和 IP 处的反汇编窗口。
+
+工具列表已为核心内存读写、断点、反汇编和 AI 工具补充输入 schema。工具调用使用标准 `tools/call`，同时保留旧的 `z0dbg.call` 形式。
+
+寄存器写入、线程枚举/单线程挂起恢复、模块枚举、补丁详细管理等接口后续可以继续补齐，继续扩展工具规模。
 
 控制命令通过 `stdio` 传输时，由 MCP Server 每行发送一个 JSON-RPC 请求到 stdout，插件每行回写一个 JSON-RPC 响应到 server stdin。
 
@@ -1517,6 +1525,18 @@ MCP Tools 插件界面语言跟随主菜单“中文 / English”的当前选择
 
 ```json
 {"jsonrpc":"2.0","id":3,"method":"z0dbg.step_over"}
+```
+
+标准 MCP 工具调用，返回结构化反汇编：
+
+```json
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"disassemble_range","arguments":{"start":"0x401000","end":"0x401080","structured":true}}}
+```
+
+一次调用生成 AI 分析摘要：
+
+```json
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"ai_brief","arguments":{"disasm_count":12,"stack_bytes":32}}}
 ```
 
 ## 10. 常见任务
