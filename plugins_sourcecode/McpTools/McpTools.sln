@@ -7,6 +7,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "McpTools", "McpTools.vcxpro
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "McpServer", "McpServer.vcxproj", "{A7A7D0C3-46B6-4F18-8E82-5CE4C66D23B6}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "Z0bDbgAgent", "Z0bDbgAgent.vcxproj", "{E4B21AB4-94CE-4E18-9874-EB4831594E52}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -31,6 +33,14 @@ Global
 		{A7A7D0C3-46B6-4F18-8E82-5CE4C66D23B6}.Release|x64.Build.0 = Release|x64
 		{A7A7D0C3-46B6-4F18-8E82-5CE4C66D23B6}.Release|x86.ActiveCfg = Release|Win32
 		{A7A7D0C3-46B6-4F18-8E82-5CE4C66D23B6}.Release|x86.Build.0 = Release|Win32
+		{E4B21AB4-94CE-4E18-9874-EB4831594E52}.Debug|x64.ActiveCfg = Debug|x64
+		{E4B21AB4-94CE-4E18-9874-EB4831594E52}.Debug|x64.Build.0 = Debug|x64
+		{E4B21AB4-94CE-4E18-9874-EB4831594E52}.Debug|x86.ActiveCfg = Debug|Win32
+		{E4B21AB4-94CE-4E18-9874-EB4831594E52}.Debug|x86.Build.0 = Debug|Win32
+		{E4B21AB4-94CE-4E18-9874-EB4831594E52}.Release|x64.ActiveCfg = Release|x64
+		{E4B21AB4-94CE-4E18-9874-EB4831594E52}.Release|x64.Build.0 = Release|x64
+		{E4B21AB4-94CE-4E18-9874-EB4831594E52}.Release|x86.ActiveCfg = Release|Win32
+		{E4B21AB4-94CE-4E18-9874-EB4831594E52}.Release|x86.Build.0 = Release|Win32
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

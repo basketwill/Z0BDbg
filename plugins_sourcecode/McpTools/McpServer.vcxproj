@@ -103,12 +103,15 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <GenerateMapFile>true</GenerateMapFile>
       <MapFileName>$(OutDir)$(TargetName).map</MapFileName>
+      <StackReserveSize>8388608</StackReserveSize>
       <RandomizedBaseAddress>true</RandomizedBaseAddress>
       <DataExecutionPrevention>true</DataExecutionPrevention>
       <SetChecksum>true</SetChecksum>
     </Link>
     <PostBuildEvent>
       <Command>if not exist "$(TargetDir)McpServer.ini" copy /Y "$(ProjectDir)McpServer.ini.template" "$(TargetDir)McpServer.ini"
+if not exist "$(TargetDir)McpServer.tools.json" copy /Y "$(ProjectDir)McpServer.tools.json.template" "$(TargetDir)McpServer.tools.json"
+copy /Y "$(ProjectDir)DebugPythonRunner.py" "$(TargetDir)DebugPythonRunner.py"
 "$(WindowsSdkDir)bin\mt.exe" -manifest "$(ProjectDir)McpServer.manifest" -outputresource:"$(TargetPath);#1"</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
@@ -166,6 +169,35 @@
     <None Include="McpServer.manifest" />
     <None Include="McpServer.ico" />
     <None Include="McpServer.ini.template" />
+    <None Include="McpServer.tools.json.template" />
+    <None Include="ModelJson.h" />
+    <None Include="ModelAdapter.h" />
+    <None Include="ModelStream.h" />
+    <None Include="ModelTools.h" />
+    <None Include="AgentModels.h" />
+    <None Include="AgentAssertions.h" />
+    <None Include="AgentBudget.h" />
+    <None Include="AgentRouting.h" />
+    <None Include="AgentKnowledgeIndex.h" />
+    <None Include="AgentQueue.h" />
+    <None Include="AgentAccessPolicy.h" />
+    <None Include="AgentObservability.h" />
+    <None Include="AgentResilience.h" />
+    <None Include="AgentTransactions.h" />
+    <None Include="AgentCredentials.h" />
+    <None Include="AgentEmbeddings.h" />
+    <None Include="AgentStorage.h" />
+    <None Include="AgentTasks.h" />
+    <None Include="AgentContext.h" />
+    <None Include="AgentCheckpoint.h" />
+    <None Include="AgentMemory.h" />
+    <None Include="AgentEvaluation.h" />
+    <None Include="AgentBenchmarks.h" />
+    <None Include="AgentTerminalUi.h" />
+    <None Include="AgentDebugWorkflow.h" />
+    <None Include="McpToolTraits.h" />
+    <None Include="DebugRuntime.h" />
+    <None Include="McpServerResource.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />

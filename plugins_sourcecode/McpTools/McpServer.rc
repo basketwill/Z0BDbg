@@ -1,6 +1,151 @@
+// Microsoft Visual C++ generated resource script.
+//
+#include "McpServerResource.h"
+
+#define APSTUDIO_READONLY_SYMBOLS
+/////////////////////////////////////////////////////////////////////////////
+//
+// Generated from the TEXTINCLUDE 2 resource.
+//
 #include <windows.h>
 
-1 ICON "McpServer.ico"
+/////////////////////////////////////////////////////////////////////////////
+#undef APSTUDIO_READONLY_SYMBOLS
+
+/////////////////////////////////////////////////////////////////////////////
+// 中文(简体，中国) resources
+
+#if !defined(AFX_RESOURCE_DLL) || defined(AFX_TARG_CHS)
+LANGUAGE LANG_CHINESE, SUBLANG_CHINESE_SIMPLIFIED
+#pragma code_page(936)
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Icon
+//
+
+// Icon with lowest ID value placed first to ensure application icon
+// remains consistent on all systems.
+1                       ICON                    "McpServer.ico"
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Dialog
+//
+
+IDD_AGENT_CONFIG DIALOGEX 0, 0, 407, 174
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Z0bDbgAgent - Model settings"
+FONT 9, "Segoe UI", 0, 0, 0x1
+BEGIN
+    LTEXT           "Provider",-1,8,7,82,14
+    COMBOBOX        IDC_CONFIG_PROVIDER,79,4,214,130,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "",IDC_CONFIG_CAPABILITY,308,19,96,14
+    LTEXT           "API URL",-1,10,27,82,14
+    EDITTEXT        IDC_CONFIG_URL,80,20,316,18,ES_AUTOHSCROLL
+    LTEXT           "Model",-1,9,50,82,14
+    EDITTEXT        IDC_CONFIG_NAME,81,46,316,18,ES_AUTOHSCROLL
+    LTEXT           "API key",-1,8,74,36,14
+    EDITTEXT        IDC_CONFIG_KEY,81,72,316,18,ES_PASSWORD | ES_AUTOHSCROLL
+    LTEXT           "Reasoning",-1,5,94,45,14
+    COMBOBOX        IDC_CONFIG_EFFORT,80,98,164,90,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Plugin port",-1,8,122,68,14
+    EDITTEXT        IDC_CONFIG_PORT,80,119,78,18,ES_AUTOHSCROLL | ES_NUMBER
+    PUSHBUTTON      "Advanced...",IDC_CONFIG_ADVANCED,7,145,77,18
+    PUSHBUTTON      "Multi-model...",IDC_CONFIG_MODELS,106,145,78,18
+    DEFPUSHBUTTON   "Save",IDOK,219,143,64,22
+    PUSHBUTTON      "Cancel",IDCANCEL,313,143,64,22
+END
+
+IDD_AGENT_INTERNAL DIALOGEX 0, 0, 600, 261
+STYLE DS_SETFONT | DS_CENTER | WS_MAXIMIZEBOX | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME
+CAPTION "Z0bDbgAgent - Internal assistant"
+FONT 9, "Segoe UI", 0, 0, 0x1
+BEGIN
+    LTEXT           "Mode",-1,12,13,32,14
+    COMBOBOX        IDC_INTERNAL_MODE,48,10,130,70,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    PUSHBUTTON      "Model settings...",IDC_INTERNAL_CONFIG,189,10,99,19
+    LTEXT           "Ready",IDC_INTERNAL_STATUS,305,13,530,15
+    CONTROL         "",IDC_INTERNAL_OUTPUT,"SysListView32",LVS_REPORT | LVS_OWNERDRAWFIXED | LVS_NOCOLUMNHEADER | WS_VSCROLL | WS_TABSTOP,198,37,390,208
+    DEFPUSHBUTTON   "Run",IDC_INTERNAL_RUN,292,250,54,9
+    PUSHBUTTON      "Stop",IDC_INTERNAL_STOP,350,250,53,9
+    CONTROL         "",IDC_INTERNAL_DETAILS,"SysListView32",LVS_REPORT | LVS_OWNERDRAWFIXED | LVS_NOCOLUMNHEADER | WS_VSCROLL | WS_TABSTOP,12,37,174,208
+    CONTROL         "more info",IDC_CHECK1,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,492,27,66,7
+END
+
+IDD_MODEL_ADVANCED DIALOGEX 0, 0, 340, 352
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Advanced model settings"
+FONT 9, "Segoe UI", 0, 0, 0x1
+BEGIN
+    LTEXT           "Max output tokens",-1,12,16,94,14
+    EDITTEXT        IDC_ADV_TOKENS,112,13,90,16,ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "0 uses provider default",-1,209,16,121,14
+    LTEXT           "Model timeout (sec)",-1,12,42,94,14
+    EDITTEXT        IDC_ADV_TIMEOUT,112,39,90,16,ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "Temperature",-1,12,68,94,14
+    EDITTEXT        IDC_ADV_TEMPERATURE,112,65,90,16,ES_AUTOHSCROLL
+    LTEXT           "Blank uses default",-1,209,68,121,14
+    LTEXT           "Top-p",-1,12,94,94,14
+    EDITTEXT        IDC_ADV_TOP_P,112,91,90,16,ES_AUTOHSCROLL
+    LTEXT           "Blank uses default",-1,209,94,121,14
+    LTEXT           "Tool choice",-1,12,120,94,14
+    COMBOBOX        IDC_ADV_TOOL_CHOICE,112,117,90,56,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Chat rounds",-1,12,146,94,14
+    EDITTEXT        IDC_ADV_TOOL_ROUNDS,112,143,90,16,ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "Task rounds",-1,12,172,94,14
+    EDITTEXT        IDC_ADV_TASK_ROUNDS,112,169,90,16,ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "0 = Unlimited",-1,209,172,121,14
+    LTEXT           "Total timeout (sec)",-1,12,198,94,14
+    EDITTEXT        IDC_ADV_TASK_TIMEOUT,112,195,90,16,ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "0 = Unlimited",-1,209,198,121,14
+    LTEXT           "Round warning",-1,12,224,94,14
+    EDITTEXT        IDC_ADV_ROUND_WARNING,112,221,90,16,ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "Time warning (sec)",-1,12,250,94,14
+    EDITTEXT        IDC_ADV_TIME_WARNING,112,247,90,16,ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "History messages",-1,12,276,94,14
+    EDITTEXT        IDC_ADV_HISTORY,112,273,90,16,ES_AUTOHSCROLL | ES_NUMBER
+    CONTROL         "Stream replies",IDC_ADV_STREAM,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,12,303,150,16
+    DEFPUSHBUTTON   "Save",IDOK,209,324,57,18
+    PUSHBUTTON      "Cancel",IDCANCEL,273,324,57,18
+END
+
+IDD_AGENT_MODELS DIALOGEX 0, 0, 420, 302
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Multi-model agent"
+FONT 9, "Segoe UI", 0, 0, 0x1
+BEGIN
+    CONTROL         "Auto route",IDC_AGENT_AUTO,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,12,12,120,16
+    CONTROL         "Failover",IDC_AGENT_FAILOVER,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,146,12,120,16
+    CONTROL         "Review",IDC_AGENT_REVIEW,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,280,12,120,16
+    LTEXT           "Model slot",-1,12,43,74,14
+    COMBOBOX        IDC_AGENT_PROFILE,92,40,150,90,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    CONTROL         "Enabled",IDC_AGENT_ENABLED,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,252,40,72,16
+    CONTROL         "Reviewer",IDC_AGENT_REVIEWER,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,330,40,78,16
+    LTEXT           "Provider",-1,12,72,74,14
+    COMBOBOX        IDC_AGENT_PROVIDER,92,69,316,90,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "API URL",-1,12,101,74,14
+    EDITTEXT        IDC_AGENT_URL,92,98,316,16,ES_AUTOHSCROLL
+    LTEXT           "Model",-1,12,130,74,14
+    EDITTEXT        IDC_AGENT_NAME,92,127,316,16,ES_AUTOHSCROLL
+    LTEXT           "API key",-1,12,159,74,14
+    EDITTEXT        IDC_AGENT_KEY,92,156,316,16,ES_PASSWORD | ES_AUTOHSCROLL
+    LTEXT           "Reasoning",-1,12,188,74,14
+    COMBOBOX        IDC_AGENT_EFFORT,92,185,108,80,CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Timeout (seconds)",-1,218,188,116,14
+    EDITTEXT        IDC_AGENT_TIMEOUT,342,185,66,16,ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "Route keywords",-1,12,217,74,14
+    EDITTEXT        IDC_AGENT_KEYWORDS,92,214,316,44,ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL
+    DEFPUSHBUTTON   "Save",IDOK,286,272,57,18
+    PUSHBUTTON      "Cancel",IDCANCEL,351,272,57,18
+END
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Version
+//
 
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION 1,0,0,0
@@ -19,17 +164,104 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
-            VALUE "CompanyName", "Z0BDbg\0"
-            VALUE "FileDescription", "MCP Server\0"
-            VALUE "FileVersion", "1.0.0.0\0"
-            VALUE "InternalName", "McpServer.exe\0"
-            VALUE "OriginalFilename", "McpServer.exe\0"
-            VALUE "ProductName", "Z0BDbg MCP Server\0"
-            VALUE "ProductVersion", "1.0.0.0\0"
+            VALUE "CompanyName", "Z0BDbg"
+            VALUE "FileDescription", "MCP Server"
+            VALUE "FileVersion", "1.0.0.0"
+            VALUE "InternalName", "McpServer.exe"
+            VALUE "OriginalFilename", "McpServer.exe"
+            VALUE "ProductName", "Z0BDbg MCP Server"
+            VALUE "ProductVersion", "1.0.0.0"
         END
     END
     BLOCK "VarFileInfo"
     BEGIN
-        VALUE "Translation", 0x0409, 1200
+        VALUE "Translation", 0x409, 1200
     END
 END
+
+
+#ifdef APSTUDIO_INVOKED
+/////////////////////////////////////////////////////////////////////////////
+//
+// TEXTINCLUDE
+//
+
+1 TEXTINCLUDE 
+BEGIN
+    "McpServerResource.h\0"
+END
+
+2 TEXTINCLUDE 
+BEGIN
+    "#include <windows.h>\r\n"
+    "\0"
+END
+
+3 TEXTINCLUDE 
+BEGIN
+    "\r\n"
+    "\0"
+END
+
+#endif    // APSTUDIO_INVOKED
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// DESIGNINFO
+//
+
+#ifdef APSTUDIO_INVOKED
+GUIDELINES DESIGNINFO
+BEGIN
+    IDD_AGENT_CONFIG, DIALOG
+    BEGIN
+        RIGHTMARGIN, 404
+        BOTTOMMARGIN, 167
+    END
+
+    IDD_AGENT_INTERNAL, DIALOG
+    BEGIN
+    END
+
+    IDD_MODEL_ADVANCED, DIALOG
+    BEGIN
+    END
+
+    IDD_AGENT_MODELS, DIALOG
+    BEGIN
+    END
+END
+#endif    // APSTUDIO_INVOKED
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// AFX_DIALOG_LAYOUT
+//
+
+IDD_AGENT_CONFIG AFX_DIALOG_LAYOUT
+BEGIN
+    0
+END
+
+IDD_AGENT_INTERNAL AFX_DIALOG_LAYOUT
+BEGIN
+    0
+END
+
+#endif    // 中文(简体，中国) resources
+/////////////////////////////////////////////////////////////////////////////
+
+
+
+#ifndef APSTUDIO_INVOKED
+/////////////////////////////////////////////////////////////////////////////
+//
+// Generated from the TEXTINCLUDE 3 resource.
+//
+
+
+/////////////////////////////////////////////////////////////////////////////
+#endif    // not APSTUDIO_INVOKED
+

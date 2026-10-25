@@ -146,5 +146,11 @@
     <ClCompile Include="McpTools.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ItemGroup>
+    <None Include="DebugRuntime.h" />
+    <None Include="AgentProcessIsolation.h" />
+    <None Include="AgentAccessPolicy.h" />
+    <None Include="McpTools.agent-isolation.ini.template" />
+  </ItemGroup>
   <ImportGroup Label="ExtensionTargets" />
 </Project>

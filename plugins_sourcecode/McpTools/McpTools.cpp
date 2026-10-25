@@ -1,7 +1,8 @@
 ﻿#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <windows.h>
+#include <tlhelp32.h>
 #include <bcrypt.h>
 #include <commctrl.h>
 #include <commdlg.h>
@@ -12,7 +13,21 @@
 #include <string>
 #include <vector>
 #include <cctype>
+#include <cwctype>
+#include <errno.h>
 #include "plugin.h"
+#include "McpToolTraits.h"
+#include "McpRpcError.h"
+#include "DebugRuntime.h"
+#include "AgentProcessIsolation.h"
+#include "StaticPeImage.h"
+#include "../../MachOImage.h"
+#include "../../StaticViewBridge.h"
+#include "../../IdaSymbolCacheFormat.h"
+
+static DebugRuntimeFeed g_debug_feed;
+static ulong* g_host_process_id = NULL;
+static DWORD g_observed_process_id = 0;
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -49,6 +64,15 @@ struct Z0B_MODULE {
 
 typedef int (__cdecl* PFN_FindnameA)(ulong addr, int type, char* name);
 typedef int (__cdecl* PFN_Getstatus)(void);
+typedef int (__cdecl* PFN_McpAttachPid)(unsigned long);
+typedef int (__cdecl* PFN_McpOpenProcess)(const wchar_t*, const wchar_t*);
+typedef int (__cdecl* PFN_McpOpenProcessEx)(const wchar_t*, const wchar_t*, int);
+typedef int (__cdecl* PFN_McpStopDebug)(void);
+typedef int (__cdecl* PFN_McpDebugState)(void);
+typedef unsigned long (__cdecl* PFN_McpActiveProcessId)(void);
+typedef int (__cdecl* PFN_McpTargetBits)(void);
+typedef int (__cdecl* PFN_McpGetRegister)(const char*, unsigned __int64*);
+typedef int (__cdecl* PFN_McpSetRegister)(const char*, unsigned __int64);
 typedef int (__cdecl* PFN_Setbreakpoint)(ulong addr, ulong type, uchar cmd);
 typedef int (__cdecl* PFN_Setbreakpointext)(ulong addr, ulong type, char cmd, ulong passcount);
 typedef void (__cdecl* PFN_Deletebreakpoints)(ulong addr0, ulong addr1, int silent);
@@ -60,7 +84,30 @@ typedef int (__cdecl* PFN_Go)(ulong threadid, ulong tilladdr, int stepmode, int 
 typedef ulong (__cdecl* PFN_Readmemory)(void* buf, ulong addr, ulong size, int mode);
 typedef ulong (__cdecl* PFN_Writememory)(const void* buf, ulong addr, ulong size, int mode);
 typedef int (__cdecl* PFN_Listmemory)(void);
-typedef ulong (__cdecl* PFN_Disasm)(uchar* cmd, ulong cmdsize, ulong ip, uchar* dec, t_disasm* da, int mode, t_reg* reg, t_predict* predict);
+struct HostDisasmOperand {
+    char optype, opsize, regscale[8], seg;
+    ulong opconst;
+};
+
+struct HostDisasm {
+    ulong ip;
+    char dump[TEXTLEN], result[TEXTLEN], comment[TEXTLEN], opinfo[3][TEXTLEN];
+    int cmdtype, memtype, nprefix, indexed;
+    ulong jmpconst, jmptable, adrconst, immconst;
+    int zeroconst, fixupoffset, fixupsize;
+    ulong jmpaddr;
+    int condition, error, warnings, optype[3], opsize[3], opgood[3];
+    ulong opaddr[3], opdata[3];
+    HostDisasmOperand op[3];
+    ulong regdata[8];
+    int regstatus[8];
+    ulong addrdata;
+    int addrstatus;
+    ulong regstack[32];
+    int rststatus[32], nregstack;
+    ulong reserved[29];
+};
+typedef ulong (__cdecl* PFN_Disasm)(uchar* cmd, ulong cmdsize, ulong ip, uchar* dec, HostDisasm* da, int mode, ulong threadid);
 typedef ulong (__cdecl* PFN_Assemble)(wchar_t* src, ulong ip, uchar* buf, ulong nbuf, int mode, wchar_t* errtxt);
 typedef int (__cdecl* PFN_Removemembreakpoint)(ulong addr);
 typedef ulong (__cdecl* PFN_Getcputhreadid)(void);
@@ -114,6 +161,17 @@ typedef BOOL (__cdecl* PFN_IsUiLanguageEnglish)(void);
 
 static PFN_FindnameA pFindnameA = NULL;
 static PFN_Getstatus pGetstatus = NULL;
+static PFN_McpAttachPid pMcpAttachPid = NULL;
+static PFN_McpOpenProcess pMcpOpenProcess = NULL;
+static PFN_McpOpenProcessEx pMcpOpenProcessEx = NULL;
+static PFN_McpStopDebug pMcpStopDebug = NULL;
+static PFN_McpDebugState pMcpDebugState = NULL;
+static PFN_McpActiveProcessId pMcpActiveProcessId = NULL;
+static PFN_McpTargetBits pMcpTargetBits = NULL;
+static PFN_McpGetRegister pMcpGetRegister = NULL;
+static PFN_McpSetRegister pMcpSetRegister = NULL;
+typedef BOOL (__cdecl* PFN_McpStaticQuery)(Z0B_StaticQuery*);
+static PFN_McpStaticQuery pMcpStaticQuery = NULL;
 static PFN_Setbreakpoint pSetbreakpoint = NULL;
 static PFN_Setbreakpointext pSetbreakpointext = NULL;
 static PFN_Deletebreakpoints pDeletebreakpoints = NULL;
@@ -361,6 +419,13 @@ struct McpConfig {
     BOOL allow_registers;
     BOOL allow_high_risk;
     BOOL confirm_high_risk;
+    BOOL agent_readonly, agent_require_target;
+    wchar_t agent_scope[128], agent_tools[1024], agent_address_min[32], agent_address_max[32];
+    int agent_max_read_bytes, agent_max_argument_kb;
+    BOOL stdio_isolate;
+    BOOL stdio_strict, agent_strict;
+    wchar_t stdio_files[2048], agent_files[2048], agent_network[2048];
+    int stdio_memory_mb, stdio_cpu_seconds;
     BOOL event_exception;
     BOOL event_thread;
     BOOL event_module;
@@ -400,6 +465,7 @@ static HANDLE g_queue_event = NULL;
 static HANDLE g_stop_event = NULL;
 static HANDLE g_worker_thread = NULL;
 static HANDLE g_stdio_process = NULL;
+static HANDLE g_stdio_job = NULL;
 static HANDLE g_stdio_stdin = NULL;
 static HANDLE g_stdio_stdout = NULL;
 static HANDLE g_stdio_reader_thread = NULL;
@@ -413,6 +479,9 @@ static std::string g_pipe_server_nonce;
 static std::string g_pipe_client_nonce;
 static volatile LONG g_runtime_ready = 0;
 static volatile LONG g_mcp_initialized = 0;
+static HANDLE g_local_dispatch_thread = NULL;
+static volatile LONG g_local_dispatch_stop = 0;
+static BOOL g_auto_confirm_local_server = FALSE;
 static volatile LONG g_reconnect_attempts = 0;
 static BOOL g_connected = FALSE;
 static wchar_t g_last_error[512];
@@ -422,13 +491,14 @@ static std::string g_last_event_key;
 
 static DWORD WINAPI StdioReaderThreadProc(LPVOID);
 static DWORD WINAPI PipeReaderThreadProc(LPVOID);
-static std::string ExecuteToolCommand(const std::string& json);
+static std::string ExecuteToolCommand(const std::string& json, bool internal_direct = false);
 static int HexDigit(char c);
 static bool JsonFindString(const std::string& json, const char* key, std::string& value);
 static std::string WideToUtf8(const wchar_t* text);
 static std::wstring Utf8ToWide(const std::string& text);
 static bool EnsureTransportReady(const McpConfig& cfg);
 static bool EnsureMcpInitialized(const McpConfig& cfg);
+static std::string ToolListJson(void);
 static std::string BuildInitializeJson(const McpConfig& cfg);
 static std::string BuildInitializedJson(void);
 static void CloseStdioProcess(void);
@@ -496,14 +566,20 @@ static void SetDefaultConfig(McpConfig* cfg)
     cfg->pipe_allow_unencrypted = TRUE;
     cfg->pipe_retain_queue = TRUE;
     cfg->allow_read = TRUE;
-    cfg->allow_write = FALSE;
-    cfg->allow_execute = FALSE;
-    cfg->allow_breakpoint = FALSE;
-    cfg->allow_patch = FALSE;
-    cfg->allow_delete_breakpoint = FALSE;
-    cfg->allow_registers = FALSE;
-    cfg->allow_high_risk = FALSE;
-    cfg->confirm_high_risk = TRUE;
+    cfg->allow_write = TRUE;
+    cfg->allow_execute = TRUE;
+    cfg->allow_breakpoint = TRUE;
+    cfg->allow_patch = TRUE;
+    cfg->allow_delete_breakpoint = TRUE;
+    cfg->allow_registers = TRUE;
+    cfg->allow_high_risk = TRUE;
+    cfg->agent_readonly = cfg->agent_require_target = FALSE;
+    cfg->agent_scope[0] = cfg->agent_tools[0] = cfg->agent_address_min[0] = cfg->agent_address_max[0] = 0;
+    cfg->agent_max_read_bytes = 1024 * 1024; cfg->agent_max_argument_kb = 64;
+    cfg->stdio_isolate = FALSE; cfg->stdio_memory_mb = 256; cfg->stdio_cpu_seconds = 300;
+    cfg->stdio_strict = cfg->agent_strict = FALSE;
+    cfg->stdio_files[0] = cfg->agent_files[0] = cfg->agent_network[0] = 0;
+    cfg->confirm_high_risk = FALSE;
     cfg->event_exception = TRUE;
     cfg->event_thread = TRUE;
     cfg->event_module = TRUE;
@@ -522,6 +598,38 @@ static void SetDefaultConfig(McpConfig* cfg)
     cfg->timeout_ms = 30000;
 }
 
+static void ApplyLocalServerEnvironment(McpConfig* cfg)
+{
+    wchar_t local_url[256] = {0};
+    DWORD local_url_length = GetEnvironmentVariableW(L"Z0B_MCP_LOCAL_URL", local_url, _countof(local_url));
+    if (!local_url_length || local_url_length >= _countof(local_url) ||
+        wcsncmp(local_url, L"http://", 7) != 0) return;
+    cfg->enabled = TRUE;
+    cfg->auto_connect = TRUE;
+    cfg->mcp_initialize = TRUE;
+    cfg->allow_breakpoint = TRUE;
+    cfg->allow_read = TRUE;
+    cfg->allow_write = TRUE;
+    cfg->allow_execute = TRUE;
+    cfg->allow_patch = TRUE;
+    cfg->allow_delete_breakpoint = TRUE;
+    cfg->allow_registers = TRUE;
+    cfg->allow_high_risk = TRUE;
+    cfg->agent_readonly = FALSE;
+    cfg->agent_strict = FALSE;
+    cfg->agent_tools[0] = 0;
+    g_auto_confirm_local_server = TRUE;
+    if (cfg->timeout_ms > 3000) cfg->timeout_ms = 3000;
+    if (cfg->request_timeout_ms > 3000) cfg->request_timeout_ms = 3000;
+    StringCchCopyW(cfg->transport, _countof(cfg->transport), L"http");
+    StringCchCopyW(cfg->http_method, _countof(cfg->http_method), L"POST");
+    StringCchCopyW(cfg->url, _countof(cfg->url), local_url);
+    wchar_t local_token[512] = {0};
+    DWORD token_length = GetEnvironmentVariableW(L"Z0B_MCP_LOCAL_TOKEN", local_token, _countof(local_token));
+    if (token_length < _countof(local_token))
+        StringCchCopyW(cfg->auth_token, _countof(cfg->auth_token), local_token);
+}
+
 template<typename T>
 static void ResolveHostExport(T* target, const char* name)
 {
@@ -531,8 +639,20 @@ static void ResolveHostExport(T* target, const char* name)
 
 static void ResolveHostExports(void)
 {
+    ResolveHostExport(&g_host_process_id, "processid");
+    if (!g_host_process_id) ResolveHostExport(&g_host_process_id, "_processid");
     ResolveHostExport(&pFindnameA, "Findname");
     ResolveHostExport(&pGetstatus, "Getstatus");
+    ResolveHostExport(&pMcpAttachPid, "Z0B_McpAttachPid");
+    ResolveHostExport(&pMcpOpenProcess, "Z0B_McpOpenProcess");
+    ResolveHostExport(&pMcpOpenProcessEx, "Z0B_McpOpenProcessEx");
+    ResolveHostExport(&pMcpStopDebug, "Z0B_McpStopDebug");
+    ResolveHostExport(&pMcpDebugState, "Z0B_McpDebugState");
+    ResolveHostExport(&pMcpActiveProcessId, "Z0B_McpActiveProcessId");
+    ResolveHostExport(&pMcpTargetBits, "Z0B_McpTargetBits");
+    ResolveHostExport(&pMcpGetRegister, "Z0B_McpGetRegister");
+    ResolveHostExport(&pMcpSetRegister, "Z0B_McpSetRegister");
+    ResolveHostExport(&pMcpStaticQuery, "Z0B_McpStaticQuery");
     ResolveHostExport(&pSetbreakpoint, "Setbreakpoint");
     ResolveHostExport(&pSetbreakpointext, "Setbreakpointext");
     ResolveHostExport(&pDeletebreakpoints, "Deletebreakpoints");
@@ -607,6 +727,13 @@ static void ResolveHostExports(void)
         ResolveHostExport(&pIsUiLanguageEnglish, "IsUiLanguageEnglish");
 }
 
+static DWORD CurrentDebugProcessId(void)
+{
+    if (pMcpActiveProcessId) return (DWORD)pMcpActiveProcessId();
+    return g_host_process_id && *g_host_process_id
+        ? (DWORD)*g_host_process_id : g_observed_process_id;
+}
+
 static void LoadConfig(void)
 {
     wchar_t path[MAX_PATH];
@@ -663,6 +790,23 @@ static void LoadConfig(void)
     cfg.pipe_allow_unencrypted = GetPrivateProfileIntW(L"pipe", L"allow_unencrypted", cfg.pipe_allow_unencrypted, path) ? TRUE : FALSE;
     cfg.pipe_retain_queue = GetPrivateProfileIntW(L"pipe", L"retain_queue", cfg.pipe_retain_queue, path) ? TRUE : FALSE;
     cfg.allow_read = GetPrivateProfileIntW(L"permissions", L"allow_read", cfg.allow_read, path) ? TRUE : FALSE;
+    cfg.agent_readonly = GetPrivateProfileIntW(L"agent_isolation", L"readonly", 0, path) != 0;
+    cfg.agent_require_target = GetPrivateProfileIntW(L"agent_isolation", L"require_target", 0, path) != 0;
+    GetPrivateProfileStringW(L"agent_isolation", L"scope", L"", cfg.agent_scope, 128, path);
+    GetPrivateProfileStringW(L"agent_isolation", L"tools", L"", cfg.agent_tools, 1024, path);
+    GetPrivateProfileStringW(L"agent_isolation", L"address_min", L"", cfg.agent_address_min, 32, path);
+    GetPrivateProfileStringW(L"agent_isolation", L"address_max", L"", cfg.agent_address_max, 32, path);
+    cfg.agent_max_read_bytes = GetPrivateProfileIntW(L"agent_isolation", L"max_read_bytes", 1024 * 1024, path);
+    cfg.agent_max_argument_kb = GetPrivateProfileIntW(L"agent_isolation", L"max_argument_kb", 64, path);
+    cfg.stdio_isolate = GetPrivateProfileIntW(L"stdio", L"isolate", 0, path) != 0;
+    cfg.stdio_strict = GetPrivateProfileIntW(L"stdio", L"strict", 0, path) != 0;
+    if (cfg.stdio_strict) cfg.stdio_isolate = TRUE;
+    GetPrivateProfileStringW(L"stdio", L"files", L"", cfg.stdio_files, 2048, path);
+    cfg.agent_strict = GetPrivateProfileIntW(L"agent_isolation", L"strict", 0, path) != 0;
+    GetPrivateProfileStringW(L"agent_isolation", L"files", L"", cfg.agent_files, 2048, path);
+    GetPrivateProfileStringW(L"agent_isolation", L"network", L"", cfg.agent_network, 2048, path);
+    cfg.stdio_memory_mb = GetPrivateProfileIntW(L"stdio", L"memory_mb", 256, path);
+    cfg.stdio_cpu_seconds = GetPrivateProfileIntW(L"stdio", L"cpu_seconds", 300, path);
     cfg.allow_write = GetPrivateProfileIntW(L"permissions", L"allow_write", cfg.allow_write, path) ? TRUE : FALSE;
     cfg.allow_execute = GetPrivateProfileIntW(L"permissions", L"allow_execute", cfg.allow_execute, path) ? TRUE : FALSE;
     cfg.allow_breakpoint = GetPrivateProfileIntW(L"permissions", L"allow_breakpoint", cfg.allow_breakpoint, path) ? TRUE : FALSE;
@@ -717,6 +861,8 @@ static void LoadConfig(void)
         cfg.log_level = 3;
     if (cfg.http_server_port <= 0 || cfg.http_server_port > 65535)
         cfg.http_server_port = 8765;
+
+    ApplyLocalServerEnvironment(&cfg);
 
     EnterCriticalSection(&g_config_cs);
     g_config = cfg;
@@ -786,6 +932,22 @@ static void SaveConfig(void)
     WriteIntIni(path, L"pipe", L"allow_unencrypted", cfg.pipe_allow_unencrypted ? 1 : 0);
     WriteIntIni(path, L"pipe", L"retain_queue", cfg.pipe_retain_queue ? 1 : 0);
     WriteIntIni(path, L"permissions", L"allow_read", cfg.allow_read ? 1 : 0);
+    WriteIntIni(path, L"agent_isolation", L"readonly", cfg.agent_readonly ? 1 : 0);
+    WriteIntIni(path, L"agent_isolation", L"require_target", cfg.agent_require_target ? 1 : 0);
+    WritePrivateProfileStringW(L"agent_isolation", L"scope", cfg.agent_scope, path);
+    WritePrivateProfileStringW(L"agent_isolation", L"tools", cfg.agent_tools, path);
+    WritePrivateProfileStringW(L"agent_isolation", L"address_min", cfg.agent_address_min, path);
+    WritePrivateProfileStringW(L"agent_isolation", L"address_max", cfg.agent_address_max, path);
+    WriteIntIni(path, L"agent_isolation", L"max_read_bytes", cfg.agent_max_read_bytes);
+    WriteIntIni(path, L"agent_isolation", L"max_argument_kb", cfg.agent_max_argument_kb);
+    WriteIntIni(path, L"stdio", L"isolate", cfg.stdio_isolate ? 1 : 0);
+    WriteIntIni(path, L"stdio", L"strict", cfg.stdio_strict ? 1 : 0);
+    WritePrivateProfileStringW(L"stdio", L"files", cfg.stdio_files, path);
+    WriteIntIni(path, L"agent_isolation", L"strict", cfg.agent_strict ? 1 : 0);
+    WritePrivateProfileStringW(L"agent_isolation", L"files", cfg.agent_files, path);
+    WritePrivateProfileStringW(L"agent_isolation", L"network", cfg.agent_network, path);
+    WriteIntIni(path, L"stdio", L"memory_mb", cfg.stdio_memory_mb);
+    WriteIntIni(path, L"stdio", L"cpu_seconds", cfg.stdio_cpu_seconds);
     WriteIntIni(path, L"permissions", L"allow_write", cfg.allow_write ? 1 : 0);
     WriteIntIni(path, L"permissions", L"allow_execute", cfg.allow_execute ? 1 : 0);
     WriteIntIni(path, L"permissions", L"allow_breakpoint", cfg.allow_breakpoint ? 1 : 0);
@@ -1132,6 +1294,7 @@ static std::string BuildBaseEventPrefix(const char* event_name)
 
 static bool HttpPostJsonWithResponse(const McpConfig& cfg, const std::string& json, std::string* response_body)
 {
+    if (cfg.agent_strict && !AccessNetworkAllowed(cfg.url, cfg.agent_network)) return false;
     if (!cfg.url[0])
         return false;
 
@@ -1181,6 +1344,12 @@ static bool HttpPostJsonWithResponse(const McpConfig& cfg, const std::string& js
         WinHttpCloseHandle(connect);
         WinHttpCloseHandle(session);
         return false;
+    }
+    if (cfg.agent_strict) {
+        DWORD disabled = WINHTTP_DISABLE_REDIRECTS | WINHTTP_DISABLE_COOKIES | WINHTTP_DISABLE_AUTHENTICATION;
+        if (!WinHttpSetOption(request, WINHTTP_OPTION_DISABLE_FEATURE, &disabled, sizeof(disabled))) {
+            WinHttpCloseHandle(request); WinHttpCloseHandle(connect); WinHttpCloseHandle(session); return false;
+        }
     }
     if (!cfg.http_verify_tls && (flags & WINHTTP_FLAG_SECURE)) {
         DWORD security_flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA |
@@ -1813,7 +1982,7 @@ static void AppendEnvironmentBlock(std::wstring& env_block, const wchar_t* lines
 static std::wstring BuildEnvironmentBlock(const McpConfig& cfg)
 {
     std::wstring env_block;
-    if (cfg.stdio_inherit_env) {
+    if (cfg.stdio_inherit_env && !cfg.stdio_isolate) {
         LPWCH current = GetEnvironmentStringsW();
         if (current) {
             for (LPWCH p = current; *p; p += lstrlenW(p) + 1) {
@@ -1821,6 +1990,13 @@ static std::wstring BuildEnvironmentBlock(const McpConfig& cfg)
                 env_block.push_back(L'\0');
             }
             FreeEnvironmentStringsW(current);
+        }
+    }
+    if (cfg.stdio_isolate) {
+        const wchar_t* names[] = { L"SystemRoot", L"TEMP", L"TMP" };
+        for (int i = 0; i < 3; ++i) {
+            wchar_t value[32768]; DWORD size = GetEnvironmentVariableW(names[i], value, _countof(value));
+            if (size && size < _countof(value)) { env_block += names[i]; env_block += L'='; env_block += value; env_block += L'\0'; }
         }
     }
     AppendEnvironmentBlock(env_block, cfg.env);
@@ -1846,6 +2022,7 @@ static bool EnsureStdioProcess(const McpConfig& cfg)
         }
         CloseHandle(g_stdio_process);
         g_stdio_process = NULL;
+        if (g_stdio_job) { CloseHandle(g_stdio_job); g_stdio_job = NULL; }
         InterlockedExchange(&g_mcp_initialized, 0);
     }
     if (!cfg.command[0])
@@ -1912,8 +2089,11 @@ static bool EnsureStdioProcess(const McpConfig& cfg)
     DWORD creation_flags = CREATE_UNICODE_ENVIRONMENT;
     if (!cfg.stdio_show_console)
         creation_flags |= CREATE_NO_WINDOW;
-    BOOL ok = CreateProcessW(NULL, &cmdline[0], NULL, NULL, TRUE, creation_flags,
-        env.empty() ? NULL : (LPVOID)env.c_str(), cfg.workdir[0] ? cfg.workdir : NULL, &si, &pi);
+    BOOL ok = cfg.stdio_isolate ? CreateIsolatedAgentProcess(&cmdline[0], env.empty() ? NULL : (LPVOID)env.c_str(),
+        cfg.workdir[0] ? cfg.workdir : NULL, creation_flags, si, cfg.stdio_memory_mb, cfg.stdio_cpu_seconds, &pi, &g_stdio_job,
+        cfg.stdio_strict ? cfg.stdio_files : NULL) :
+        CreateProcessW(NULL, &cmdline[0], NULL, NULL, TRUE, creation_flags,
+            env.empty() ? NULL : (LPVOID)env.c_str(), cfg.workdir[0] ? cfg.workdir : NULL, &si, &pi);
     if (stderr_handle)
         CloseHandle(stderr_handle);
     CloseHandle(child_stdin_read);
@@ -1949,6 +2129,7 @@ static void CloseStdioProcess(void)
         CloseHandle(g_stdio_process);
         g_stdio_process = NULL;
     }
+    if (g_stdio_job) { CloseHandle(g_stdio_job); g_stdio_job = NULL; }
     InterlockedExchange(&g_mcp_initialized, 0);
     SetRuntimeStatus(FALSE, NULL);
     LeaveCriticalSection(&g_stdio_cs);
@@ -1981,6 +2162,7 @@ static bool SendStdioJson(const McpConfig& cfg, const std::string& json)
             CloseHandle(g_stdio_process);
             g_stdio_process = NULL;
         }
+        if (g_stdio_job) { CloseHandle(g_stdio_job); g_stdio_job = NULL; }
         SetConnectionError(McpText(L"stdio 写入失败。", L"stdio write failed."));
         LeaveCriticalSection(&g_stdio_cs);
         return false;
@@ -2016,6 +2198,55 @@ static bool EnsureTransportReady(const McpConfig& cfg)
     return true;
 }
 
+static DWORD WINAPI LocalDispatchThread(LPVOID parameter)
+{
+    McpConfig cfg = *(McpConfig*)parameter;
+    delete (McpConfig*)parameter;
+    unsigned request_number = 2000;
+    DWORD last_registration = 0;
+    while (InterlockedCompareExchange(&g_local_dispatch_stop, 0, 0) == 0) {
+        // The local MCP Server may restart while the debugger remains open.
+        // Re-register the catalog so the new server instance can discover it.
+        DWORD now = GetTickCount();
+        if (last_registration == 0 || now - last_registration >= 2000) {
+            char registration_id[32]; sprintf_s(registration_id, sizeof(registration_id), "%u", request_number++);
+            std::string registration = "{\"jsonrpc\":\"2.0\",\"id\":" + std::string(registration_id) +
+                ",\"method\":\"z0dbg/register_tools\",\"params\":{\"tools\":" +
+                ToolListJson() + "}}";
+            if (SendJsonRequestWithResponse(cfg, registration, NULL, false))
+                last_registration = now;
+        }
+        char id[32]; sprintf_s(id, sizeof(id), "%u", request_number++);
+        std::string poll = "{\"jsonrpc\":\"2.0\",\"id\":" + std::string(id) +
+            ",\"method\":\"z0dbg/poll\",\"params\":{}}";
+        std::string response;
+        if (SendJsonRequestWithResponse(cfg, poll, &response, false)) {
+            if (InterlockedCompareExchange(&g_local_dispatch_stop, 0, 0) != 0)
+                break;
+            ModelJson root;
+            const ModelJson* result = NULL;
+            const ModelJson* pending = NULL;
+            if (ModelJson::parse(response, &root) && (result = root.get("result")) &&
+                (pending = result->get("pending")) && pending->raw == "true") {
+                const ModelJson* request_id = result->get("request_id");
+                const ModelJson* request = result->get("request");
+                if (request_id && request && request_id->kind == ModelJson::STRING && request->kind == ModelJson::STRING) {
+                    std::string tool_response = ExecuteToolCommand(request->value);
+                    if (InterlockedCompareExchange(&g_local_dispatch_stop, 0, 0) != 0)
+                        break;
+                    std::string submit = "{\"jsonrpc\":\"2.0\",\"id\":" + std::string(id) +
+                        ",\"method\":\"z0dbg/result\",\"params\":{\"request_id\":";
+                    JsonAppendEscaped(submit, request_id->value.c_str()); submit += ",\"response\":";
+                    JsonAppendEscaped(submit, tool_response.c_str()); submit += "}}";
+                    SendJsonRequestWithResponse(cfg, submit, NULL, false);
+                }
+            }
+        }
+        Sleep(50);
+    }
+    return 0;
+}
+
 static bool EnsureMcpInitialized(const McpConfig& cfg)
 {
     if (!cfg.mcp_initialize)
@@ -2037,6 +2268,20 @@ static bool EnsureMcpInitialized(const McpConfig& cfg)
     }
     if (ok) {
         InterlockedExchange(&g_mcp_initialized, 1);
+        // Advertise the debugger tools to a local MCP Server so it can serve
+        // the catalog directly to its model conversation.
+        std::string registration = "{\"jsonrpc\":\"2.0\",\"id\":1004,\"method\":\"z0dbg/register_tools\",\"params\":{\"tools\":" +
+            ToolListJson() + "}}";
+        std::string registration_response;
+        if (!SendJsonRequestWithResponse(cfg, registration, &registration_response, false)) {
+            InterlockedExchange(&g_mcp_initialized, 0);
+            return false;
+        }
+        if (!g_local_dispatch_thread) {
+            McpConfig* worker_cfg = new McpConfig(cfg);
+            InterlockedExchange(&g_local_dispatch_stop, 0);
+            g_local_dispatch_thread = CreateThread(NULL, 0, LocalDispatchThread, worker_cfg, 0, NULL);
+        }
         return true;
     }
     InterlockedExchange(&g_mcp_initialized, 0);
@@ -2051,9 +2296,13 @@ static bool SendJsonToServer(const McpConfig& cfg, const std::string& json)
     if (cfg.auto_reconnect)
         attempts = cfg.reconnect_max_attempts > 0 ? cfg.reconnect_max_attempts : 1;
     for (int attempt = 0; attempt < attempts; ++attempt) {
+        if (g_stop_event && WaitForSingleObject(g_stop_event, 0) == WAIT_OBJECT_0)
+            return false;
         if (attempt > 0) {
             InterlockedIncrement(&g_reconnect_attempts);
-            Sleep((DWORD)cfg.reconnect_interval_ms);
+            if (g_stop_event && WaitForSingleObject(g_stop_event,
+                (DWORD)cfg.reconnect_interval_ms) == WAIT_OBJECT_0)
+                return false;
         }
         if (!EnsureTransportReady(cfg) || !EnsureMcpInitialized(cfg))
             continue;
@@ -2095,6 +2344,8 @@ static DWORD WINAPI WorkerThreadProc(LPVOID)
         if (wait == WAIT_OBJECT_0)
             break;
         for (;;) {
+            if (WaitForSingleObject(g_stop_event, 0) == WAIT_OBJECT_0)
+                break;
             std::string item;
             EnterCriticalSection(&g_queue_cs);
             if (!g_queue.empty()) {
@@ -2112,7 +2363,9 @@ static DWORD WINAPI WorkerThreadProc(LPVOID)
                 if (g_queue.size() < MCP_MAX_QUEUE)
                     g_queue.push_front(item);
                 LeaveCriticalSection(&g_queue_cs);
-                Sleep((DWORD)cfg.reconnect_interval_ms);
+                if (WaitForSingleObject(g_stop_event,
+                    (DWORD)cfg.reconnect_interval_ms) == WAIT_OBJECT_0)
+                    break;
             }
         }
     }
@@ -2135,14 +2388,20 @@ static void StartWorker(void)
 static void StopWorker(void)
 {
     InterlockedExchange(&g_runtime_ready, 0);
-    StopHttpServer();
+    InterlockedExchange(&g_local_dispatch_stop, 1);
     if (g_stop_event)
         SetEvent(g_stop_event);
     if (g_worker_thread) {
-        WaitForSingleObject(g_worker_thread, 3000);
+        WaitForSingleObject(g_worker_thread, INFINITE);
         CloseHandle(g_worker_thread);
         g_worker_thread = NULL;
     }
+    if (g_local_dispatch_thread) {
+        WaitForSingleObject(g_local_dispatch_thread, INFINITE);
+        CloseHandle(g_local_dispatch_thread);
+        g_local_dispatch_thread = NULL;
+    }
+    StopHttpServer();
     if (g_queue_event) {
         CloseHandle(g_queue_event);
         g_queue_event = NULL;
@@ -2209,6 +2468,12 @@ static void AppendDebugEventData(std::string& json, const DEBUG_EVENT* ev)
         json += num;
         json += ",\"exceptionAddress\":";
         JsonAppendHex64(json, (unsigned __int64)(ULONG_PTR)ev->u.Exception.ExceptionRecord.ExceptionAddress);
+        if ((ev->u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
+            ev->u.Exception.ExceptionRecord.ExceptionCode == EXCEPTION_IN_PAGE_ERROR) && ev->u.Exception.ExceptionRecord.NumberParameters >= 2) {
+            json += ",\"accessType\":" + DebugRuntimeFeed::number(ev->u.Exception.ExceptionRecord.ExceptionInformation[0]);
+            json += ",\"faultAddress\":";
+            JsonAppendHex64(json, ev->u.Exception.ExceptionRecord.ExceptionInformation[1]);
+        }
         json += ",\"firstChance\":";
         json += ev->u.Exception.dwFirstChance ? "true" : "false";
         break;
@@ -2272,6 +2537,13 @@ static void QueueDebuggerEvent(const DEBUG_EVENT* ev)
 {
     if (!ev)
         return;
+    std::string captured = "{";
+    AppendDebugEventData(captured, ev);
+    // AppendDebugEventData starts fields with a comma.
+    if (captured.size() > 1 && captured[1] == ',') captured.erase(1, 1);
+    captured += "}";
+    g_debug_feed.push(captured, ev->dwDebugEventCode == LOAD_DLL_DEBUG_EVENT || ev->dwDebugEventCode == UNLOAD_DLL_DEBUG_EVENT,
+        ev->dwDebugEventCode == EXCEPTION_DEBUG_EVENT, captured);
     McpConfig cfg = CopyConfig();
     if (!cfg.send_debug_events)
         return;
@@ -2381,70 +2653,44 @@ static void QueueSimpleEvent(const char* event_name)
 
 static bool JsonFindString(const std::string& json, const char* key, std::string& value)
 {
-    std::string pattern = "\"";
-    pattern += key;
-    pattern += "\"";
-    size_t p = json.find(pattern);
-    if (p == std::string::npos)
-        return false;
-    p = json.find(':', p + pattern.size());
-    if (p == std::string::npos)
-        return false;
-    p = json.find('"', p + 1);
-    if (p == std::string::npos)
-        return false;
-    value.clear();
-    for (++p; p < json.size(); ++p) {
-        char c = json[p];
-        if (c == '"')
-            return true;
-        if (c == '\\' && p + 1 < json.size()) {
-            char e = json[++p];
-            switch (e) {
-            case 'n': value.push_back('\n'); break;
-            case 'r': value.push_back('\r'); break;
-            case 't': value.push_back('\t'); break;
-            case '\\': value.push_back('\\'); break;
-            case '"': value.push_back('"'); break;
-            default: value.push_back(e); break;
-            }
-        }
-        else {
-            value.push_back(c);
-        }
-    }
-    return false;
+    ModelJson root;
+    if (!ModelJson::parse(json, &root)) return false;
+    const ModelJson* field = root.get(key), *params = root.get("params");
+    if (!field && params) field = params->get(key);
+    const ModelJson* args = params ? params->get("arguments") : root.get("arguments");
+    if (!field && args) field = args->get(key);
+    if (!field || field->kind != ModelJson::STRING) return false;
+    value = field->value; return true;
 }
 
 static bool JsonFindUInt64(const std::string& json, const char* key, unsigned __int64& value)
 {
-    std::string text;
-    if (JsonFindString(json, key, text)) {
-        char* end = NULL;
-        value = _strtoui64(text.c_str(), &end, 0);
-        return end && end != text.c_str();
-    }
-    std::string pattern = "\"";
-    pattern += key;
-    pattern += "\"";
-    size_t p = json.find(pattern);
-    if (p == std::string::npos)
-        return false;
-    p = json.find(':', p + pattern.size());
-    if (p == std::string::npos)
-        return false;
-    ++p;
-    while (p < json.size() && (json[p] == ' ' || json[p] == '\t'))
-        ++p;
-    size_t start = p;
-    while (p < json.size() && (isalnum((unsigned char)json[p]) || json[p] == 'x' || json[p] == 'X'))
-        ++p;
-    if (p == start)
-        return false;
-    std::string num = json.substr(start, p - start);
-    char* end = NULL;
-    value = _strtoui64(num.c_str(), &end, 0);
-    return end && end != num.c_str();
+    ModelJson root;
+    if (!ModelJson::parse(json, &root)) return false;
+    const ModelJson* field = root.get(key), *params = root.get("params");
+    if (!field && params) field = params->get(key);
+    const ModelJson* args = params ? params->get("arguments") : root.get("arguments");
+    if (!field && args) field = args->get(key);
+    if (!field || (field->kind != ModelJson::STRING && field->kind != ModelJson::NUMBER)) return false;
+    const std::string& text = field->kind == ModelJson::STRING ? field->value : field->raw;
+    if (text.empty() || text[0] == '-' || text[0] == '+' || isspace((unsigned char)text[0])) return false;
+    char* end = NULL; errno = 0;
+    unsigned __int64 parsed = _strtoui64(text.c_str(), &end, field->kind == ModelJson::STRING ? 0 : 10);
+    if (errno == ERANGE || !end || end == text.c_str() || *end) return false;
+    value = parsed; return true;
+}
+
+static bool ListPageArguments(const std::string& json, unsigned __int64 default_limit,
+    unsigned __int64& offset, unsigned __int64& limit)
+{
+    ModelJson args;
+    if (!ModelJson::parse(json, &args) || args.kind != ModelJson::OBJECT) return false;
+    offset = 0; limit = default_limit;
+    const ModelJson* field = args.get("offset");
+    if (field && (field->kind != ModelJson::NUMBER || !JsonFindUInt64(json, "offset", offset))) return false;
+    field = args.get("limit");
+    if (field && (field->kind != ModelJson::NUMBER || !JsonFindUInt64(json, "limit", limit))) return false;
+    return offset <= 65535 && limit >= 1 && limit <= 64;
 }
 
 static std::wstring Utf8ToWide(const std::string& text)
@@ -2512,10 +2758,279 @@ static ulong BreakAccessFromText(const std::string& access, ulong def)
     return def;
 }
 
+static bool StaticDebugTargetPath(wchar_t* path, size_t capacity)
+{
+    if (!path || !capacity) return false;
+    DWORD pid = pMcpActiveProcessId ? CurrentDebugProcessId() : 0;
+    if (!pid) return false;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (snapshot == INVALID_HANDLE_VALUE) return false;
+    MODULEENTRY32W module = {}; module.dwSize = sizeof(module);
+    bool found = Module32FirstW(snapshot, &module) != FALSE;
+    if (found) {
+        size_t name_length = wcslen(module.szModule);
+        found = name_length >= 4 &&
+            _wcsicmp(module.szModule + name_length - 4, L".exe") == 0 &&
+            wcslen(module.szExePath) < capacity &&
+            SUCCEEDED(StringCchCopyW(path, capacity, module.szExePath));
+    }
+    CloseHandle(snapshot);
+    return found;
+}
+
+class IdaMappedSymbolCache {
+    HANDLE file_, mapping_;
+    const unsigned char* data_;
+    const IdaMappedSymbolRecord* records_;
+    size_t count_;
+    unsigned __int64 image_base_;
+    unsigned __int64 strings_offset_;
+    unsigned __int64 file_size_;
+public:
+    IdaMappedSymbolCache() : file_(INVALID_HANDLE_VALUE), mapping_(NULL), data_(NULL),
+        records_(NULL), count_(0), image_base_(0), strings_offset_(0), file_size_(0) {}
+    ~IdaMappedSymbolCache() {
+        if (data_) UnmapViewOfFile(data_);
+        if (mapping_) CloseHandle(mapping_);
+        if (file_ != INVALID_HANDLE_VALUE) CloseHandle(file_);
+    }
+    bool open(const wchar_t* source, const StaticPeImage& image) {
+        WIN32_FILE_ATTRIBUTE_DATA info = {};
+        GUID guid = {};
+        DWORD age = 0;
+        if (!GetFileAttributesExW(source, GetFileExInfoStandard, &info) ||
+            !image.pdb_identity(&guid, &age)) return false;
+        unsigned __int64 source_size = ((unsigned __int64)info.nFileSizeHigh << 32) | info.nFileSizeLow;
+        unsigned __int64 hash = 1469598103934665603ULL;
+        for (const wchar_t* p = source; *p; ++p)
+            hash = (hash ^ (unsigned short)towlower(*p)) * 1099511628211ULL;
+        hash = (hash ^ source_size) * 1099511628211ULL;
+        hash = (hash ^ (((unsigned __int64)info.ftLastWriteTime.dwHighDateTime << 32) |
+            info.ftLastWriteTime.dwLowDateTime)) * 1099511628211ULL;
+        wchar_t directory[MAX_PATH] = {};
+        DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", directory, _countof(directory));
+        if (!length || length >= _countof(directory)) {
+            length = GetTempPathW(_countof(directory), directory);
+            if (!length || length >= _countof(directory)) return false;
+        }
+        while (length && (directory[length - 1] == L'\\' || directory[length - 1] == L'/'))
+            directory[--length] = 0;
+        wchar_t path[MAX_PATH] = {};
+        if (FAILED(StringCchPrintfW(path, _countof(path),
+            L"%s\\Z0BDbg\\IdaCache\\%016llX.sym", directory, hash))) return false;
+        file_ = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        LARGE_INTEGER size = {};
+        if (file_ == INVALID_HANDLE_VALUE || !GetFileSizeEx(file_, &size) ||
+            size.QuadPart < sizeof(IdaMappedSymbolHeader) ||
+            (unsigned __int64)size.QuadPart > SIZE_MAX) return false;
+        mapping_ = CreateFileMappingW(file_, NULL, PAGE_READONLY, 0, 0, NULL);
+        if (!mapping_) return false;
+        data_ = (const unsigned char*)MapViewOfFile(mapping_, FILE_MAP_READ, 0, 0, 0);
+        if (!data_) return false;
+        const IdaMappedSymbolHeader* header = (const IdaMappedSymbolHeader*)data_;
+        static const char magic[8] = {'Z','0','S','Y','M','0','0','1'};
+        unsigned __int64 file_size = (unsigned __int64)size.QuadPart;
+        if (memcmp(header->Magic, magic, sizeof(magic)) != 0 ||
+            memcmp(&header->PdbGuid, &guid, sizeof(guid)) != 0 || header->PdbAge != age ||
+            header->SourceSize != source_size ||
+            CompareFileTime(&header->SourceTime, &info.ftLastWriteTime) != 0 ||
+            header->Count > (file_size - sizeof(*header)) / sizeof(IdaMappedSymbolRecord) ||
+            header->StringsOffset != sizeof(*header) +
+                header->Count * sizeof(IdaMappedSymbolRecord)) return false;
+        records_ = (const IdaMappedSymbolRecord*)(data_ + sizeof(*header));
+        count_ = (size_t)header->Count;
+        strings_offset_ = header->StringsOffset;
+        image_base_ = image.image_base();
+        file_size_ = file_size;
+        return true;
+    }
+    const wchar_t* find(unsigned __int64 address) const {
+        if (!records_ || address < image_base_) return NULL;
+        unsigned __int64 rva = address - image_base_;
+        const IdaMappedSymbolRecord* found = std::lower_bound(records_, records_ + count_, rva,
+            [](const IdaMappedSymbolRecord& record, unsigned __int64 value) {
+                return record.Rva < value;
+            });
+        if (found == records_ + count_ || found->Rva != rva || !found->NameLength ||
+            found->NameOffset > file_size_ - strings_offset_) return NULL;
+        unsigned __int64 bytes = ((unsigned __int64)found->NameLength + 1) * sizeof(wchar_t);
+        if (bytes > file_size_ - strings_offset_ - found->NameOffset) return NULL;
+        const wchar_t* name = (const wchar_t*)(data_ + strings_offset_ + found->NameOffset);
+        return name[found->NameLength] == 0 ? name : NULL;
+    }
+};
+
+static unsigned __int64 ResolveLoadedModuleExport(DWORD pid, const std::string& qualified,
+    unsigned depth = 0)
+{
+    size_t separator = qualified.find('!');
+    if (!pid || !separator || separator == qualified.size() - 1 || depth >= 4) return 0;
+    std::wstring module_name = Utf8ToWide(qualified.substr(0, separator));
+    if (module_name.empty()) return 0;
+    if (module_name.find(L'.') == std::wstring::npos) module_name += L".dll";
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (snapshot == INVALID_HANDLE_VALUE) return 0;
+    MODULEENTRY32W module = {}; module.dwSize = sizeof(module);
+    bool found = false;
+    if (Module32FirstW(snapshot, &module)) do {
+        if (_wcsicmp(module.szModule, module_name.c_str()) == 0) { found = true; break; }
+    } while (Module32NextW(snapshot, &module));
+    CloseHandle(snapshot);
+    if (!found) return 0;
+
+    StaticPeImage image;
+    DWORD rva = 0;
+    std::string forwarder;
+    if (!image.open(module.szExePath) ||
+        !image.find_export(qualified.substr(separator + 1), &rva, &forwarder)) return 0;
+    if (!forwarder.empty()) {
+        size_t dot = forwarder.rfind('.');
+        return dot == std::string::npos ? 0 :
+            ResolveLoadedModuleExport(pid, forwarder.substr(0, dot) + "!" + forwarder.substr(dot + 1), depth + 1);
+    }
+    return rva < module.modBaseSize ? (unsigned __int64)(ULONG_PTR)module.modBaseAddr + rva : 0;
+}
+
+static unsigned __int64 FindLoadedMainImport(DWORD pid, const std::string& name,
+    unsigned __int64 range_start = 0, unsigned __int64 range_size = 0)
+{
+    if (!pid || name.empty()) return 0;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (snapshot == INVALID_HANDLE_VALUE) return 0;
+    MODULEENTRY32W module = {}; module.dwSize = sizeof(module);
+    bool found = Module32FirstW(snapshot, &module) != FALSE;
+    CloseHandle(snapshot);
+    if (!found) return 0;
+    StaticPeImage image;
+    DWORD rva = 0;
+    if (!image.open(module.szExePath) || !image.find_import(name, &rva) ||
+        rva >= module.modBaseSize) return 0;
+    unsigned __int64 slot = (unsigned __int64)(ULONG_PTR)module.modBaseAddr + rva;
+    if (range_start && (slot < range_start ||
+        (range_size && slot - range_start >= range_size))) return 0;
+    return slot;
+}
+
+static bool ToolExportAvailable(const std::string& tool)
+{
+    if (tool.find("static_") == 0) {
+        wchar_t target[MAX_PATH] = {0};
+        return pMcpStaticQuery != NULL || StaticDebugTargetPath(target, _countof(target));
+    }
+    struct Export { const char* name; bool available; };
+    Export exports[] = {
+        { "get_status", pGetstatus != NULL }, { "get_cpu_thread_id", pGetcputhreadid != NULL },
+        { "debug_open_process", pMcpOpenProcess != NULL || pMcpOpenProcessEx != NULL },
+        { "debug_attach_pid", pMcpAttachPid != NULL }, { "debug_stop", pMcpStopDebug != NULL },
+        { "register_get", pMcpGetRegister && pMcpTargetBits },
+        { "register_list", pMcpGetRegister && pMcpTargetBits },
+        { "register_set", pMcpSetRegister != NULL },
+        { "stack_get_pointers", pMcpGetRegister && pMcpTargetBits },
+        { "stack_read", pReadmemory != NULL },
+        { "breakpoint_list", pGetnextbreakpoint != NULL },
+        { "dump_memory_region", pReadmemory != NULL },
+        { "run", pRun != NULL }, { "go", pGo && pGetcputhreadid }, { "pause", pSuspendprocess != NULL },
+        { "step_into", pRun != NULL }, { "step_over", pRun != NULL }, { "trace_into", pRun != NULL }, { "trace_over", pRun != NULL },
+        { "auto_step_into", pRun != NULL }, { "auto_step_over", pRun != NULL },
+        { "read_memory", pReadmemory != NULL }, { "write_memory", pWritememory != NULL }, { "list_memory", pListmemory != NULL },
+        { "find_memory", pFindmemory != NULL }, { "find_data_ptr", pFinddataptr != NULL },
+        { "set_software_breakpoint", pSetbreakpoint != NULL }, { "set_software_breakpoint_ext", pSetbreakpointext != NULL },
+        { "delete_software_breakpoint", pSetbreakpoint != NULL }, { "delete_breakpoint_range", pDeletebreakpoints != NULL },
+        { "delete_all_breakpoints", pDeletebreakpoints != NULL }, { "set_memory_breakpoint", pSetmembreakpointSimple != NULL },
+        { "delete_memory_breakpoint", pRemovemembreakpoint != NULL }, { "set_hardware_breakpoint", pSethardwarebreakpoint != NULL },
+        { "delete_hardware_breakpoint", pDeletehardwarebreakbyaddr || pDeletehardwarebreakpoint },
+        { "get_breakpoint_type", pGetbreakpointtype != NULL }, { "get_breakpoint_type_count", pGetbreakpointtypecount != NULL },
+        { "get_next_breakpoint", pGetnextbreakpoint != NULL }, { "set_temp_breakpoint", pTempbreakpoint != NULL },
+        { "plugin_temp_breakpoint", pPlugintempbreakpoint != NULL }, { "disassemble", pReadmemory && pDisasm },
+        { "assemble", pAssemble && pWritememory }, { "set_cpu", pSetcpu && pGetcputhreadid }, { "set_disasm", pSetdisasm != NULL },
+        { "evaluate", pExpressionA && pGetcputhreadid }, { "resolve_symbol", true }, { "find_name", pFindnameA != NULL }, { "insert_name", pInsertnameA != NULL },
+        { "decode_address", pDecodeaddressA != NULL }, { "decode_name", pDecodenameA != NULL }, { "comment_address", pCommentaddressW != NULL },
+        { "simple_address", pSimpleaddressW != NULL }, { "find_label", pFindlabelA != NULL }, { "find_module", pFindmodule != NULL },
+        { "find_thread", pFindthread && pGetcputhreadid }, { "find_data", pFinddataA != NULL }, { "find_decode", pFinddecodeA != NULL },
+        { "find_strings", pFindstringsA != NULL }, { "find_references", pFindreferencesA != NULL }, { "find_import_by_name", true },
+        { "find_file_offset", pFindfileoffset != NULL }, { "follow_call", pFollowcall != NULL }, { "walk_reference", pWalkreference != NULL },
+        { "walk_reference_ex", pWalkreferenceex != NULL }, { "is_prefix", pIsprefix != NULL }, { "get_last_error", pGetlasterrorW != NULL },
+        { "get_cpu_disasm_dump", pGetcpudisasmdump != NULL }, { "get_cpu_disasm_table", pGetcpudisasmtable != NULL },
+        { "plugin_read_ini_int", pPluginreadintfromini != NULL }, { "plugin_write_ini_int", pPluginwriteinttoini != NULL },
+        { "plugin_read_ini_string", pPluginreadstringfromini != NULL }, { "plugin_write_ini_string", pPluginwritestringtoini != NULL },
+        { "redraw_disasm", pRedrawcpudisasm != NULL }, { "redraw_registers", pRedrawcpureg != NULL }, { "redraw_list", pRedrawlist != NULL },
+        { "suspend_all_threads", pSuspendallthreads != NULL }, { "resume_all_threads", pResumeallthreads != NULL },
+        { "show_hardware_breakpoints", pHardbreakpoints != NULL }, { "show_threads", pCreatethreadwindow != NULL },
+        { "show_trace", pCreatertracewindow != NULL }, { "show_windows", pCreatewinwindow != NULL }, { "show_patches", pCreatepatchwindow != NULL },
+        { "show_watch", pCreatewatchwindow != NULL }, { "set_trace_condition", pSettraceconditionA != NULL }, { "set_trace_count", pSettracecount != NULL },
+        { "set_trace_pause_on_commands", pSettracepauseoncommandsA != NULL }, { "set_dump_type", pSetdumptype != NULL },
+        { "dump_backup", pDumpbackup != NULL }, { "plugin_module_changed", pPluginmodulechanged != NULL }
+    };
+    for (size_t i = 0; i < _countof(exports); ++i) if (tool == exports[i].name) return exports[i].available;
+    return true;
+}
+
+static std::string ToolInputSchema(const std::string& tool)
+{
+    if (tool == "static_pe_info" || tool == "static_macho_info" || tool == "static_list_sections")
+        return "{\"type\":\"object\",\"additionalProperties\":false}";
+    if (tool == "static_list_imports" || tool == "static_list_exports")
+        return "{\"type\":\"object\",\"properties\":{\"offset\":{\"type\":\"integer\",\"minimum\":0},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":64}},\"additionalProperties\":false}";
+    if (tool == "static_list_strings")
+        return "{\"type\":\"object\",\"properties\":{\"file_offset\":{\"type\":\"integer\",\"minimum\":0},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":64},\"min_length\":{\"type\":\"integer\",\"minimum\":4,\"maximum\":32}},\"additionalProperties\":false}";
+    if (tool == "static_read_bytes")
+        return "{\"type\":\"object\",\"properties\":{\"address\":{\"type\":[\"integer\",\"string\"]},\"size\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":4096}},\"required\":[\"address\",\"size\"],\"additionalProperties\":false}";
+    if (tool == "static_disassemble")
+        return "{\"type\":\"object\",\"properties\":{\"address\":{\"type\":[\"integer\",\"string\"]},\"count\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":32}},\"required\":[\"address\"],\"additionalProperties\":false}";
+    if (tool == "debug_find_process") return "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"Exact executable name, with or without .exe\"}},\"required\":[\"name\"],\"additionalProperties\":false}";
+    if (tool == "debug_open_process") return "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Absolute path to a local executable\"},\"arguments\":{\"type\":\"string\",\"description\":\"Optional command-line arguments\"},\"auto_run\":{\"type\":\"boolean\",\"description\":\"Default false: pause at the entry point. True: continue through the initial breakpoint and run until another stop or exit.\"}},\"required\":[\"path\"],\"additionalProperties\":false}";
+    if (tool == "debug_attach_pid") return "{\"type\":\"object\",\"properties\":{\"pid\":{\"type\":\"integer\",\"minimum\":1}},\"required\":[\"pid\"],\"additionalProperties\":false}";
+    if (tool == "register_get") return "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"General-purpose register name\"}},\"required\":[\"name\"],\"additionalProperties\":false}";
+    if (tool == "register_set") return "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"value\":{\"type\":[\"integer\",\"string\"],\"description\":\"Unsigned integer or 0x-prefixed hexadecimal value\"}},\"required\":[\"name\",\"value\"],\"additionalProperties\":false}";
+    if (tool == "stack_read") return "{\"type\":\"object\",\"properties\":{\"address\":{\"type\":[\"integer\",\"string\"]},\"size\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":65536}},\"required\":[\"address\",\"size\"],\"additionalProperties\":false}";
+    if (tool == "thread_get") return "{\"type\":\"object\",\"properties\":{\"thread_id\":{\"type\":\"integer\",\"minimum\":1}},\"required\":[\"thread_id\"],\"additionalProperties\":false}";
+    if (tool == "module_get") return "{\"type\":\"object\",\"properties\":{\"address\":{\"type\":[\"integer\",\"string\"]}},\"required\":[\"address\"],\"additionalProperties\":false}";
+    if (tool == "thread_list" || tool == "module_list" || tool == "breakpoint_list")
+        return "{\"type\":\"object\",\"properties\":{\"offset\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":65535},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":64}},\"additionalProperties\":false}";
+    if (tool == "dump_memory_region") return "{\"type\":\"object\",\"properties\":{\"address\":{\"type\":[\"integer\",\"string\"]},\"size\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":16777216},\"output_path\":{\"type\":\"string\"}},\"required\":[\"address\",\"size\",\"output_path\"],\"additionalProperties\":false}";
+    if (tool == "get_event_capabilities" || tool == "debug_stop" || tool == "register_list" || tool == "stack_get_pointers" ||
+        tool == "thread_list" || tool == "module_list")
+        return "{\"type\":\"object\",\"additionalProperties\":false}";
+    if (tool == "wait_debug_event") return "{\"type\":\"object\",\"properties\":{\"cursor\":{\"type\":\"integer\",\"minimum\":0},\"timeout_ms\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":1000}},\"required\":[\"cursor\"],\"additionalProperties\":false}";
+    if (tool == "evaluate") return "{\"type\":\"object\",\"properties\":{\"expression\":{\"type\":\"string\",\"description\":\"Debugger expression, including registers and memory dereferences\"}},\"required\":[\"expression\"]}";
+    if (tool == "resolve_symbol") return "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"Export symbol, preferably module!function, for example KernelBase!CreateFileW\"}},\"required\":[\"name\"],\"additionalProperties\":false}";
+    std::string address = "\"address\":{\"type\":[\"integer\",\"string\"],\"description\":\"Absolute address: decimal integer or 0x-prefixed hexadecimal string\"}";
+    if (tool == "read_memory") return "{\"type\":\"object\",\"properties\":{" + address +
+        ",\"size\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":1048576}},\"required\":[\"address\",\"size\"]}";
+    if (tool == "write_memory") return "{\"type\":\"object\",\"properties\":{" + address +
+        ",\"hex\":{\"type\":\"string\",\"description\":\"Bytes as hexadecimal pairs, for example 90 90\"},\"expected_hex\":{\"type\":\"string\",\"description\":\"Optional exact current bytes; mismatch refuses the write\"}},\"required\":[\"address\",\"hex\"]}";
+    if (tool == "assemble") return "{\"type\":\"object\",\"properties\":{" + address +
+        ",\"assembly\":{\"type\":\"string\"}},\"required\":[\"address\",\"assembly\"]}";
+    if (tool == "disassemble" || tool == "find_memory" || tool == "find_module" || tool == "follow_call" ||
+        tool == "get_breakpoint_type" || tool == "get_breakpoint_type_count")
+        return "{\"type\":\"object\",\"properties\":{" + address + "},\"required\":[\"address\"]}";
+    if (tool == "set_software_breakpoint" || tool == "delete_software_breakpoint")
+        return "{\"type\":\"object\",\"properties\":{" + address +
+            "},\"required\":[\"address\"],\"additionalProperties\":false}";
+    if (tool == "find_references")
+        return "{\"type\":\"object\",\"properties\":{" + address +
+            ",\"size\":{\"type\":\"integer\",\"minimum\":1},\"target\":{\"type\":[\"integer\",\"string\"]},\"target1\":{\"type\":[\"integer\",\"string\"]},\"text\":{\"type\":\"string\"}},\"required\":[\"address\",\"size\",\"target\"],\"additionalProperties\":false}";
+    if (tool == "find_import_by_name")
+        return "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"Imported function name, for example ReadFile or WriteFile\"}," +
+            address + ",\"size\":{\"type\":\"integer\",\"minimum\":1}},\"required\":[\"name\"],\"additionalProperties\":false}";
+    if (tool == "go") return "{\"type\":\"object\",\"properties\":{" + address + "}}";
+    return "{\"type\":\"object\"}";
+}
+
 static std::string ToolListJson(void)
 {
+    Z0B_StaticQuery static_view = {};
+    static_view.version = Z0B_STATIC_QUERY_VERSION;
+    static_view.operation = Z0B_STATIC_QUERY_ACTIVE;
+    wchar_t target[MAX_PATH] = {0};
+    bool static_available = (pMcpStaticQuery && pMcpStaticQuery(&static_view)) ||
+        StaticDebugTargetPath(target, _countof(target));
     const char* tools[] = {
-        "get_status", "get_cpu_thread_id", "run", "go", "pause", "step_into", "step_over", "trace_into", "trace_over",
+        "static_pe_info", "static_macho_info", "static_list_sections", "static_list_imports", "static_list_exports", "static_list_strings", "static_read_bytes", "static_disassemble",
+        "get_status", "get_cpu_thread_id", "get_debug_context", "get_event_capabilities", "get_isolation_policy", "wait_debug_event", "run", "go", "pause", "step_into", "step_over", "trace_into", "trace_over",
+        "debug_find_process", "debug_open_process", "debug_attach_pid", "debug_stop", "register_get", "register_list", "register_set", "stack_get_pointers", "stack_read",
+        "thread_list", "thread_get", "module_list", "module_get", "breakpoint_list", "dump_memory_region",
         "auto_step_into", "auto_step_over",
         "read_memory", "write_memory", "list_memory", "find_memory", "find_data_ptr",
         "set_software_breakpoint", "set_software_breakpoint_ext", "delete_software_breakpoint", "delete_breakpoint_range", "delete_all_breakpoints",
@@ -2524,7 +3039,7 @@ static std::string ToolListJson(void)
         "get_breakpoint_type", "get_breakpoint_type_count", "get_next_breakpoint", "set_temp_breakpoint",
         "plugin_temp_breakpoint",
         "disassemble", "assemble", "set_cpu", "set_disasm",
-        "evaluate", "find_name", "insert_name", "decode_address", "decode_name", "comment_address", "simple_address", "find_label", "find_module", "find_thread", "find_data", "find_decode", "find_strings", "find_references", "find_import_by_name", "find_file_offset", "follow_call", "walk_reference", "walk_reference_ex", "is_prefix",
+        "evaluate", "resolve_symbol", "find_name", "insert_name", "decode_address", "decode_name", "comment_address", "simple_address", "find_label", "find_module", "find_thread", "find_data", "find_decode", "find_strings", "find_references", "find_import_by_name", "find_file_offset", "follow_call", "walk_reference", "walk_reference_ex", "is_prefix",
         "get_last_error", "get_cpu_disasm_dump", "get_cpu_disasm_table",
         "plugin_read_ini_int", "plugin_write_ini_int", "plugin_read_ini_string", "plugin_write_ini_string",
         "redraw_disasm", "redraw_registers", "redraw_list", "redraw_all",
@@ -2535,15 +3050,54 @@ static std::string ToolListJson(void)
     };
     std::string out = "[";
     for (size_t i = 0; i < _countof(tools); ++i) {
-        if (i)
+        if (!static_available && std::string(tools[i]).find("static_") == 0) continue;
+        if (!ToolExportAvailable(tools[i])) continue;
+        if (out.size() > 1)
             out += ",";
         out += "{\"name\":";
         JsonAppendEscaped(out, tools[i]);
         std::string description = "Z0BDbg debugger tool: ";
         description += tools[i];
+        if (std::string(tools[i]) == "debug_find_process") description = "Find running processes by exact executable name before attaching; returns up to 16 PID candidates";
+        if (std::string(tools[i]) == "debug_open_process") description = "Open a local executable in the debugger. By default it pauses at the entry point; set auto_run=true to continue after the initial breakpoint. Requires no active target. Read get_debug_context after opening; use run later if paused.";
+        if (std::string(tools[i]) == "debug_attach_pid") description = "Attach the debugger to a running process by PID; closes the current debug session";
+        if (std::string(tools[i]) == "debug_stop") description = "Stop the current debug session using the host close policy";
+        if (std::string(tools[i]) == "set_software_breakpoint") description = "Set an executable software breakpoint at a numeric absolute address in the paused debug target. Resolve module!function with resolve_symbol first; pause a running target before setting the breakpoint";
+        if (std::string(tools[i]) == "run") description = "Continue execution of the paused debug target until the next debug event or breakpoint";
+        if (std::string(tools[i]) == "resolve_symbol") description = "Resolve a loaded target module's exported function entry as a runtime virtual address, including while running. Use module!function, for example ntdll!NtQuerySystemInformation. Pass the result to disassemble when paused, or to a breakpoint tool; never pass it directly to static_disassemble. A missing import does not imply a missing export";
+        if (std::string(tools[i]) == "find_import_by_name") description = "Find an import table slot in the loaded main executable's file-backed imports, not a function entry. An absent import does not prove the API is unused; it may be resolved dynamically. Use resolve_symbol for executable breakpoints";
+        if (std::string(tools[i]) == "breakpoint_list") description = "Page through configured breakpoints with offset and limit; works while the target is running. Running results are a best-effort observation and may change between calls";
+        if (std::string(tools[i]) == "get_breakpoint_type" || std::string(tools[i]) == "get_breakpoint_type_count") description = "Read the configured breakpoint type at a numeric address, including while the target is running. Running results may change between calls";
+        if (std::string(tools[i]) == "get_cpu_thread_id") description = "Read the selected CPU thread ID; available while running, but it is not a current register snapshot";
+        if (std::string(tools[i]) == "register_get") description = "Read one general-purpose register from the current debugger thread";
+        if (std::string(tools[i]) == "register_list") description = "Read general-purpose registers from the current debugger thread; requires a paused target. For a running target, wait for a debug event or pause it first";
+        if (std::string(tools[i]) == "register_set") description = "Set a general-purpose register in the paused debugger thread";
+        if (std::string(tools[i]) == "stack_get_pointers") description = "Read the current thread's stack and frame pointers";
+        if (std::string(tools[i]) == "stack_read") description = "Read bytes at a stack address; maximum 64 KiB";
+        if (std::string(tools[i]) == "thread_list") description = "Page through target threads with offset and limit; default 16, maximum 64. Uses a system snapshot and works while the target is running";
+        if (std::string(tools[i]) == "thread_get") description = "Get a thread belonging to the debug target";
+        if (std::string(tools[i]) == "module_list") description = "Page through target modules with offset and limit; default 8, maximum 64";
+        if (std::string(tools[i]) == "module_get") description = "Get the module containing an address";
+        if (std::string(tools[i]) == "dump_memory_region") description = "Write a raw memory region to a new local file; never overwrite an existing file";
+        if (std::string(tools[i]) == "get_debug_context") description += " (runtime v1: session/process/thread/status/revision/modules/event cursor; status 18=paused, 19=running; use this context for target identity)";
+        if (std::string(tools[i]) == "get_event_capabilities") description = "List debugger event kinds, payload fields, currently enabled server notifications, and how to read the event feed. Call before planning event-driven debugging";
+        if (std::string(tools[i]) == "wait_debug_event") description = "Read debugger events after a cursor (0..1000 ms long poll). Includes exceptions/breakpoints, process/thread/module events, debug strings and state changes. On gap, refresh context";
+        if (std::string(tools[i]) == "static_pe_info") description = "Read PE metadata from the active -ida static view or current debug target executable on disk, including while the target is running; includes machine, image base and entry point";
+        if (std::string(tools[i]) == "static_macho_info") description = "Read Mach-O or Universal/Fat header and architecture slices from the active -ida static view; reports the preferred default slice; no debug target required";
+        if (std::string(tools[i]) == "static_list_sections") description = "List PE sections in the active -ida view or current debug target executable on disk; addresses use the preferred image base";
+        if (std::string(tools[i]) == "static_list_imports") description = "Page through PE imports and IAT addresses in the active -ida view or current debug target executable on disk";
+        if (std::string(tools[i]) == "static_list_exports") description = "Page through named PE exports in the active -ida view or current debug target executable on disk";
+        if (std::string(tools[i]) == "static_list_strings") description = "Page through printable ASCII and UTF-16LE strings in the active -ida view or current debug target executable on disk";
+        if (std::string(tools[i]) == "static_read_bytes") description = "Read file-backed bytes by preferred virtual address from the active -ida view or current debug target executable on disk, maximum 4096 bytes";
+        if (std::string(tools[i]) == "static_disassemble") description = "Decode up to 32 file-backed instructions in the active -ida view or current debug target executable on disk. Address must belong to that PE at its preferred image base, not a resolve_symbol runtime address from another module; use disassemble for loaded module code when paused";
         out += ",\"description\":";
         JsonAppendEscaped(out, description.c_str());
-        out += ",\"inputSchema\":{\"type\":\"object\"}}";
+        out += ",\"inputSchema\":";
+        out += ToolInputSchema(tools[i]);
+        out += ",\"annotations\":{\"readOnlyHint\":";
+        out += McpReadOnlyTool(tools[i]) ? "true" : "false";
+        out += ",\"destructiveHint\":";
+        out += McpKnownDangerousTool(tools[i]) ? "true}}" : "false}}";
     }
     out += "]";
     return out;
@@ -2559,23 +3113,6 @@ static std::string JsonRpcResult(const std::string& id, const std::string& resul
     out += ",\"result\":";
     out += result_json;
     out += "}";
-    return out;
-}
-
-static std::string JsonRpcError(const std::string& id, int code, const char* message)
-{
-    char num[32];
-    StringCchPrintfA(num, _countof(num), "%d", code);
-    std::string out = "{\"jsonrpc\":\"2.0\",\"id\":";
-    if (id.empty())
-        out += "null";
-    else
-        out += id;
-    out += ",\"error\":{\"code\":";
-    out += num;
-    out += ",\"message\":";
-    JsonAppendEscaped(out, message);
-    out += "}}";
     return out;
 }
 
@@ -2610,21 +3147,59 @@ static std::string ExtractIdJson(const std::string& json)
 
 static bool IsReadTool(const std::string& tool)
 {
-    return tool == "get_status" || tool == "get_cpu_thread_id" ||
-        tool == "read_memory" || tool == "list_memory" ||
-        tool == "find_memory" || tool == "find_data_ptr" ||
-        tool == "get_breakpoint_type" || tool == "get_breakpoint_type_count" ||
-        tool == "get_next_breakpoint" || tool == "disassemble" ||
-        tool == "evaluate" || tool == "find_name" || tool == "decode_address" ||
-        tool == "decode_name" || tool == "simple_address" || tool == "find_label" ||
-        tool == "find_module" || tool == "find_thread" || tool == "find_data" ||
-        tool == "find_decode" || tool == "find_strings" || tool == "find_references" ||
-        tool == "find_import_by_name" || tool == "find_file_offset" ||
-        tool == "follow_call" || tool == "walk_reference" ||
-        tool == "walk_reference_ex" || tool == "is_prefix" ||
-        tool == "get_last_error" || tool == "get_cpu_disasm_dump" ||
-        tool == "get_cpu_disasm_table" || tool == "plugin_read_ini_int" ||
-        tool == "plugin_read_ini_string";
+    return McpReadOnlyTool(tool);
+}
+
+static std::string EventCapabilitiesJson(const McpConfig& cfg)
+{
+    struct EventKind { const char* name; const char* fields; };
+    static const EventKind kinds[] = {
+        { "state_changed", "state_changed,status" },
+        { "process_exit", "notify" },
+        { "exception", "debugEventCode,debugEventName,processId,threadId,exceptionCode,exceptionAddress,firstChance,accessType,faultAddress" },
+        { "create_process", "debugEventCode,debugEventName,processId,threadId,imageBase,startAddress,threadLocalBase" },
+        { "exit_process", "debugEventCode,debugEventName,processId,threadId,exitCode" },
+        { "create_thread", "debugEventCode,debugEventName,processId,threadId,threadStartAddress,threadLocalBase" },
+        { "exit_thread", "debugEventCode,debugEventName,processId,threadId,exitCode" },
+        { "load_dll", "debugEventCode,debugEventName,processId,threadId,dllBase,imageNameAddress,unicodeImageName" },
+        { "unload_dll", "debugEventCode,debugEventName,processId,threadId,dllBase" },
+        { "output_debug_string", "debugEventCode,debugEventName,processId,threadId,stringAddress,stringLength,unicodeString" },
+        { "rip", "debugEventCode,debugEventName,processId,threadId,error,type" }
+    };
+    std::string out = "{\"version\":1,\"feed\":{\"tool\":\"wait_debug_event\",\"cursor_from\":\"get_debug_context.sequence\",\"max_timeout_ms\":1000,\"capacity\":256,\"gap_action\":\"refresh get_debug_context\",\"kinds\":[";
+    for (size_t i = 0; i < _countof(kinds); ++i) {
+        if (i) out += ',';
+        out += "{\"name\":";
+        JsonAppendEscaped(out, kinds[i].name);
+        out += ",\"fields\":[";
+        std::string fields = kinds[i].fields;
+        for (size_t start = 0; start < fields.size();) {
+            size_t end = fields.find(',', start);
+            if (end == std::string::npos) end = fields.size();
+            if (start) out += ',';
+            JsonAppendEscaped(out, fields.substr(start, end - start).c_str());
+            start = end + 1;
+        }
+        out += "]}";
+    }
+    out += "],\"exception_notes\":\"Software breakpoints use exceptionCode 0x80000003; single-step uses 0x80000004. Refresh context before acting.\"},\"server_notifications\":{\"method\":\"z0dbg/event\",\"enabled\":";
+    out += cfg.send_debug_events ? "true" : "false";
+    out += ",\"delivery\":\"Wakes waiting MCP tasks; event details reach the model through wait_debug_event, not an unsolicited model request.\",\"categories\":{";
+    struct Category { const char* name; BOOL enabled; };
+    Category categories[] = {
+        { "exception", cfg.event_exception }, { "thread", cfg.event_thread },
+        { "process", cfg.event_process }, { "module", cfg.event_module },
+        { "output_debug_string", cfg.event_output },
+        { "rip", TRUE }, { "other_plugin_notify", TRUE }
+    };
+    for (size_t i = 0; i < _countof(categories); ++i) {
+        if (i) out += ',';
+        JsonAppendEscaped(out, categories[i].name);
+        out += ':';
+        out += cfg.send_debug_events && categories[i].enabled ? "true" : "false";
+    }
+    out += "}}}";
+    return out;
 }
 
 static bool IsBreakpointTool(const std::string& tool)
@@ -2635,7 +3210,8 @@ static bool IsBreakpointTool(const std::string& tool)
 
 static bool IsExecuteTool(const std::string& tool)
 {
-    return tool == "run" || tool == "go" || tool == "pause" ||
+    return tool == "debug_open_process" || tool == "debug_attach_pid" || tool == "debug_stop" ||
+        tool == "run" || tool == "go" || tool == "pause" ||
         tool == "step_into" || tool == "step_over" || tool == "trace_into" ||
         tool == "trace_over" || tool == "auto_step_into" ||
         tool == "auto_step_over" || tool == "suspend_all_threads" ||
@@ -2650,7 +3226,8 @@ static bool IsExecuteTool(const std::string& tool)
 
 static bool IsWriteTool(const std::string& tool)
 {
-    return tool == "write_memory" || tool == "insert_name" ||
+    return tool == "register_set" || tool == "dump_memory_region" ||
+        tool == "write_memory" || tool == "insert_name" ||
         tool == "comment_address" || tool == "set_cpu" ||
         tool == "set_disasm" || tool == "set_trace_condition" ||
         tool == "set_trace_count" || tool == "set_trace_pause_on_commands" ||
@@ -2676,12 +3253,14 @@ static bool IsDeleteBreakpointTool(const std::string& tool)
 
 static bool IsRegisterTool(const std::string& tool)
 {
-    return tool == "set_cpu" || tool == "set_disasm";
+    return tool == "register_set" || tool == "set_cpu" || tool == "set_disasm";
 }
 
 static bool IsHighRiskTool(const std::string& tool)
 {
-    return tool == "run" || tool == "go" || tool == "pause" ||
+    return tool == "debug_open_process" || tool == "debug_attach_pid" || tool == "debug_stop" ||
+        tool == "register_set" || tool == "dump_memory_region" ||
+        tool == "run" || tool == "go" || tool == "pause" ||
         tool == "step_into" || tool == "step_over" ||
         tool == "trace_into" || tool == "trace_over" ||
         tool == "auto_step_into" || tool == "auto_step_over" ||
@@ -2690,13 +3269,18 @@ static bool IsHighRiskTool(const std::string& tool)
         tool == "set_trace_pause_on_commands" || tool == "dump_backup";
 }
 
-static bool ConfirmHighRiskTool(const McpConfig& cfg, const std::string& tool)
+static bool ConfirmHighRiskTool(const McpConfig& cfg, const std::string& tool, bool internal_direct = false)
 {
     if (!IsHighRiskTool(tool))
         return true;
     if (!cfg.allow_high_risk)
         return false;
-    if (!cfg.confirm_high_risk)
+    if (internal_direct || g_auto_confirm_local_server)
+        return true;
+    bool always_confirm = tool == "debug_open_process" || tool == "debug_attach_pid" || tool == "debug_stop" ||
+        tool == "run" || tool == "go" ||
+        tool == "register_set" || tool == "dump_memory_region" || tool == "dump_backup";
+    if (!cfg.confirm_high_risk && !always_confirm)
         return true;
     std::wstring wide = Utf8ToWide(tool);
     wchar_t text[512];
@@ -2708,10 +3292,12 @@ static bool ConfirmHighRiskTool(const McpConfig& cfg, const std::string& tool)
         MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES;
 }
 
-static bool IsToolAllowed(const McpConfig& cfg, const std::string& tool)
+static bool IsToolAllowed(const McpConfig& cfg, const std::string& tool, bool internal_direct = false)
 {
-    if (IsHighRiskTool(tool) && !ConfirmHighRiskTool(cfg, tool))
+    if (IsHighRiskTool(tool) && !ConfirmHighRiskTool(cfg, tool, internal_direct))
         return false;
+    if (IsReadTool(tool))
+        return cfg.allow_read ? true : false;
     if (IsDeleteBreakpointTool(tool) && !cfg.allow_delete_breakpoint)
         return false;
     if (IsRegisterTool(tool) && !cfg.allow_registers)
@@ -2724,12 +3310,61 @@ static bool IsToolAllowed(const McpConfig& cfg, const std::string& tool)
         return false;
     if (IsWriteTool(tool) && !cfg.allow_write)
         return false;
-    if (IsReadTool(tool))
-        return cfg.allow_read ? true : false;
     return cfg.allow_execute || cfg.allow_write;
 }
 
-static std::string ExecuteToolCommand(const std::string& json)
+static bool NativeAgentScopeAllowed(const McpConfig& cfg, const std::string& tool, const ModelJson& rpc,
+    const std::string& arguments)
+{
+    if (cfg.agent_strict) {
+        ModelJson args;
+        if (tool == "plugin_write_ini_int" || tool == "plugin_write_ini_string" || !ModelJson::parse(arguments, &args) || !AccessArgumentsAllowed(args, cfg.agent_files, cfg.agent_network) ||
+            (!McpReadOnlyTool(tool) && !McpKnownModifyTool(tool) && !McpKnownDangerousTool(tool))) return false;
+    }
+    const ModelJson* params = rpc.get("params"), *meta = params ? params->get("_meta") : NULL;
+    if (cfg.agent_scope[0]) {
+        const ModelJson* scope = meta ? meta->get("z0dbg/scope") : NULL;
+        if (!scope || scope->kind != ModelJson::STRING || scope->value != WideToUtf8(cfg.agent_scope)) return false;
+    }
+    if (cfg.agent_readonly && !McpReadOnlyTool(tool)) return false;
+    if (cfg.agent_tools[0]) {
+        std::string list = WideToUtf8(cfg.agent_tools); bool found = false;
+        for (size_t start = 0; start < list.size();) {
+            size_t end = list.find(',', start); if (end == std::string::npos) end = list.size();
+            std::string name = list.substr(start, end - start);
+            size_t first = name.find_first_not_of(" \t"), last = name.find_last_not_of(" \t");
+            if (first != std::string::npos && name.substr(first, last - first + 1) == tool) found = true;
+            start = end + 1;
+        }
+        if (!found) return false;
+    }
+    if (cfg.agent_max_argument_kb < 1 || cfg.agent_max_argument_kb > 256 || arguments.size() > (size_t)cfg.agent_max_argument_kb * 1024) return false;
+    if (cfg.agent_require_target && tool.find("static_") != 0 && tool != "get_debug_context" && tool != "get_event_capabilities" && tool != "get_isolation_policy" &&
+        tool != "debug_find_process" && tool != "debug_open_process" && tool != "debug_attach_pid") {
+        const ModelJson* target = meta ? meta->get("z0dbg/target") : NULL; ModelJson context;
+        if (!target || target->kind != ModelJson::STRING || !ModelJson::parse(g_debug_feed.context(), &context) ||
+            target->value != context.get("session")->value + ":" + context.get("process_id")->raw) return false;
+    }
+    bool ranged = cfg.agent_address_min[0] || cfg.agent_address_max[0];
+    if (tool == "read_memory" || tool == "stack_read" || tool == "dump_memory_region" || tool == "disassemble") {
+        unsigned __int64 address = 0, size = 32;
+        if (!JsonFindUInt64(arguments, "address", address)) JsonFindUInt64(arguments, "addr", address);
+        if ((tool == "read_memory" || tool == "stack_read" || tool == "dump_memory_region") && !JsonFindUInt64(arguments, "size", size)) return false;
+        if (!size || cfg.agent_max_read_bytes < 1 || cfg.agent_max_read_bytes > 1024 * 1024 || size > (unsigned int)cfg.agent_max_read_bytes) return false;
+        if (ranged) {
+            unsigned __int64 first = 0, last = 0;
+            std::string bounds = "{\"first\":"; JsonAppendWide(bounds, cfg.agent_address_min);
+            bounds += ",\"last\":"; JsonAppendWide(bounds, cfg.agent_address_max); bounds += '}';
+            if (!JsonFindUInt64(bounds, "first", first) || !JsonFindUInt64(bounds, "last", last) || first > last ||
+                address < first || address > last || size - 1 > last - address) return false;
+        }
+    }
+    else if (ranged && tool != "get_debug_context" && tool != "get_event_capabilities" && tool != "get_isolation_policy" && tool != "get_status" && tool != "get_cpu_thread_id" && tool != "wait_debug_event" &&
+        tool != "debug_find_process" && tool != "debug_open_process" && tool != "debug_attach_pid") return false;
+    return true;
+}
+
+static std::string ExecuteToolCommand(const std::string& json, bool internal_direct)
 {
     std::string id = ExtractIdJson(json);
     std::string method;
@@ -2760,121 +3395,596 @@ static std::string ExecuteToolCommand(const std::string& json)
     std::string tool;
     if (!JsonFindString(json, "tool", tool))
         JsonFindString(json, "name", tool);
-    // Standard MCP tools/call carries the tool name in params.name and
-    // arguments as ordinary JSON fields. The existing argument extraction
-    // below intentionally reads those fields without requiring a JSON DOM.
-    if (method == "tools/call" && tool.empty())
-        JsonFindString(json, "name", tool);
+    ModelJson rpc;
+    if (!ModelJson::parse(json, &rpc)) return McpRpcErrorResponse(id, MCP_RPC_INVALID_JSON);
+    const ModelJson* call_params = rpc.get("params");
+    const ModelJson* call_arguments = call_params ? call_params->get("arguments") : NULL;
+    if (method == "tools/call") {
+        const ModelJson* call_name = call_params ? call_params->get("name") : NULL;
+        if (!call_name || call_name->kind != ModelJson::STRING || (call_arguments && call_arguments->kind != ModelJson::OBJECT))
+            return McpRpcErrorResponse(id, MCP_RPC_TOOLS_CALL_REQUIRES_PARAMS_NAME_AND_OBJECT_ARGUMENTS);
+        tool = call_name->value;
+    }
     if (tool.empty() && method.find("z0dbg.") == 0)
         tool = method.substr(6);
     if (tool.empty())
-        return JsonRpcError(id, -32601, "missing tool name");
+        return McpRpcErrorResponse(id, MCP_RPC_MISSING_TOOL_NAME);
     McpConfig permission_config = CopyConfig();
-    if (!IsToolAllowed(permission_config, tool))
-        return JsonRpcError(id, -32003, "tool is disabled by MCP Tools permissions");
+    if (!NativeAgentScopeAllowed(permission_config, tool, rpc, method == "tools/call" ? (call_arguments ? call_arguments->raw : "{}") : json))
+        return McpRpcErrorResponse(id, MCP_RPC_SERVER_AGENT_ISOLATION_REFUSED_SCOPE_TOOL_TARGET_RANGE_BUD);
+    if (!IsToolAllowed(permission_config, tool, internal_direct))
+        return McpRpcErrorResponse(id, MCP_RPC_TOOL_IS_DISABLED_BY_MCP_TOOLS_PERMISSIONS);
+
+    if (tool.find("static_") == 0) {
+        Z0B_StaticQuery query = {};
+        query.version = Z0B_STATIC_QUERY_VERSION;
+        query.operation = Z0B_STATIC_QUERY_ACTIVE;
+        bool active_view = pMcpStaticQuery && pMcpStaticQuery(&query);
+        if (!active_view && !StaticDebugTargetPath(query.path, _countof(query.path)))
+            return McpRpcErrorResponse(id, MCP_RPC_STATIC_SOURCE_UNAVAILABLE);
+        if (permission_config.agent_strict &&
+            !AccessFileAllowed(query.path, permission_config.agent_files))
+            return McpRpcErrorResponse(id, MCP_RPC_STATIC_FILE_IS_OUTSIDE_THE_AGENT_FILE_SCOPE);
+        if (tool == "static_macho_info") {
+            MachOImage macho;
+            if (!macho.open(query.path)) return McpRpcErrorResponse(id, MCP_RPC_ACTIVE_STATIC_FILE_IS_NOT_A_VALID_MACH_O_IMAGE);
+            std::string result = "{\"ok\":true,\"format\":\"mach-o\",\"fat\":";
+            result += macho.fat() ? "true" : "false";
+            result += ",\"file_size\":" + std::to_string((unsigned long long)macho.file_size());
+            result += ",\"preferred_slice\":" + std::to_string((unsigned long long)macho.preferred_slice());
+            result += ",\"slices\":[";
+            for (size_t i = 0; i < macho.slices().size(); ++i) {
+                const MachOImage::Slice& slice = macho.slices()[i];
+                if (i) result += ',';
+                result += "{\"index\":" + std::to_string((unsigned long long)i);
+                result += ",\"cpu\":"; ModelJson::quote(&result, WideToUtf8(MachOImage::cpu_name(slice.cpu_type)));
+                result += ",\"cpu_type\":" + std::to_string((unsigned long long)slice.cpu_type);
+                result += ",\"cpu_subtype\":" + std::to_string((unsigned long long)slice.cpu_subtype);
+                result += ",\"bits\":" + std::string(slice.is64 ? "64" : "32");
+                result += ",\"file_type\":" + std::to_string((unsigned long long)slice.file_type);
+                result += ",\"offset\":" + std::to_string((unsigned long long)slice.offset);
+                result += ",\"size\":" + std::to_string((unsigned long long)slice.size);
+                result += ",\"load_commands\":" + std::to_string((unsigned long long)slice.command_count);
+                result += ",\"load_command_bytes\":" + std::to_string((unsigned long long)slice.command_bytes);
+                result += ",\"segment_count\":" + std::to_string((unsigned long long)slice.segments.size());
+                size_t sections = 0;
+                for (size_t s = 0; s < slice.segments.size(); ++s)
+                    sections += slice.segments[s].sections.size();
+                result += ",\"section_count\":" + std::to_string((unsigned long long)sections);
+                result += ",\"little_endian\":" + std::string(slice.little_endian ? "true" : "false") + '}';
+            }
+            return JsonRpcResult(id, result + "]}");
+        }
+        StaticPeImage image;
+        if (!image.open(query.path)) return McpRpcErrorResponse(id, MCP_RPC_COULD_NOT_READ_A_VALID_PE_FILE_FROM_THE_STATIC_VIEW);
+        std::string args = method == "tools/call" ?
+            (call_arguments ? call_arguments->raw : "{}") : json;
+        if (tool == "static_pe_info") return JsonRpcResult(id, image.info(query.path));
+        if (tool == "static_list_sections") return JsonRpcResult(id, image.sections());
+        if (tool == "static_list_imports" || tool == "static_list_exports") {
+            unsigned __int64 offset = 0, limit = 32;
+            JsonFindUInt64(args, "offset", offset);
+            JsonFindUInt64(args, "limit", limit);
+            if (offset > 1000000 || !limit || limit > 64) return McpRpcErrorResponse(id, MCP_RPC_INVALID_OFFSET_OR_LIMIT);
+            return JsonRpcResult(id, tool == "static_list_imports" ?
+                image.imports((size_t)offset, (size_t)limit) : image.exports((size_t)offset, (size_t)limit));
+        }
+        if (tool == "static_list_strings") {
+            unsigned __int64 offset = 0, limit = 32, minimum = 4;
+            JsonFindUInt64(args, "file_offset", offset);
+            JsonFindUInt64(args, "limit", limit);
+            JsonFindUInt64(args, "min_length", minimum);
+            if (offset > 0x20000000ULL || !limit || limit > 64 || minimum < 4 || minimum > 32)
+                return McpRpcErrorResponse(id, MCP_RPC_INVALID_STRING_SCAN_PARAMETERS);
+            return JsonRpcResult(id, image.strings((size_t)offset, (size_t)limit, (size_t)minimum));
+        }
+        unsigned __int64 address = 0;
+        if (!JsonFindUInt64(args, "address", address) || !address)
+            return McpRpcErrorResponse(id, MCP_RPC_ABSOLUTE_STATIC_ADDRESS_IS_REQUIRED);
+        if (tool == "static_read_bytes") {
+            unsigned __int64 size = 0;
+            if (!JsonFindUInt64(args, "size", size) || !size || size > 4096 ||
+                size > (unsigned)permission_config.agent_max_read_bytes)
+                return McpRpcErrorResponse(id, MCP_RPC_INVALID_STATIC_BYTE_COUNT);
+            return JsonRpcResult(id, image.bytes(address, (size_t)size));
+        }
+        if (tool == "static_disassemble") {
+            unsigned __int64 count = 8;
+            JsonFindUInt64(args, "count", count);
+            if (!count || count > 32) return McpRpcErrorResponse(id, MCP_RPC_INVALID_INSTRUCTION_COUNT);
+            IdaMappedSymbolCache cached_symbols;
+            bool have_cached_symbols = !active_view && cached_symbols.open(query.path, image);
+            const unsigned __int64 requested_address = address;
+            std::string result = "{\"ok\":true,\"path\":";
+            JsonAppendWide(result, query.path);
+            result += ",\"instructions\":[";
+            size_t decoded = 0;
+            bool zero_padding = false;
+            for (; decoded < count; ++decoded) {
+                unsigned char probe[4] = {0};
+                if (image.read(address, probe, sizeof(probe)) == sizeof(probe) &&
+                    !probe[0] && !probe[1] && !probe[2] && !probe[3]) {
+                    zero_padding = true;
+                    break;
+                }
+                Z0B_StaticQuery line = {};
+                const wchar_t* symbol = NULL;
+                const wchar_t* target_symbol = NULL;
+                unsigned __int64 target_address = 0;
+                line.version = Z0B_STATIC_QUERY_VERSION;
+                line.operation = Z0B_STATIC_QUERY_DISASSEMBLE;
+                line.address = address;
+                if (active_view) {
+                    if (!pMcpStaticQuery(&line) || !line.instruction_size ||
+                        wcscmp(line.path, query.path) != 0) break;
+                } else {
+                    unsigned char bytes[32] = {0};
+                    size_t available = image.read(address, bytes, sizeof(bytes));
+                    if (!available || !pDisasm) break;
+                    HostDisasm decoded_line = {};
+                    ulong length = pDisasm(bytes, (ulong)available, (ulong)address,
+                        NULL, &decoded_line, 0, 0);
+                    if (!length || length > available) break;
+                    line.instruction_size = (DWORD)length;
+                    MultiByteToWideChar(CP_ACP, 0, decoded_line.result, -1, line.text, _countof(line.text));
+                    if (have_cached_symbols) {
+                        symbol = cached_symbols.find(address);
+                        target_address = decoded_line.jmpaddr;
+                        if (target_address) target_symbol = cached_symbols.find(target_address);
+                        if (target_symbol && wcslen(line.text) + wcslen(target_symbol) + 3 < _countof(line.text)) {
+                            StringCchCatW(line.text, _countof(line.text), L" ; ");
+                            StringCchCatW(line.text, _countof(line.text), target_symbol);
+                        }
+                    }
+                    static const wchar_t digits[] = L"0123456789ABCDEF";
+                    for (size_t byte = 0; byte < length && byte * 2 + 1 < _countof(line.bytes); ++byte) {
+                        line.bytes[byte * 2] = digits[bytes[byte] >> 4];
+                        line.bytes[byte * 2 + 1] = digits[bytes[byte] & 15];
+                    }
+                }
+                if (decoded) result += ',';
+                result += "{\"address\":"; JsonAppendHex64(result, address);
+                result += ",\"size\":" + std::to_string((unsigned long long)line.instruction_size);
+                result += ",\"hex\":"; JsonAppendWide(result, line.bytes);
+                result += ",\"text\":"; JsonAppendWide(result, line.text);
+                if (symbol) { result += ",\"symbol\":"; JsonAppendWide(result, symbol); }
+                if (target_symbol) {
+                    result += ",\"target_address\":"; JsonAppendHex64(result, target_address);
+                    result += ",\"target_symbol\":"; JsonAppendWide(result, target_symbol);
+                }
+                result += '}';
+                address += line.instruction_size;
+            }
+            if (!decoded && !zero_padding) {
+                unsigned char file_byte = 0;
+                if (!image.read(requested_address, &file_byte, 1)) {
+                    char address_text[32], base_text[32];
+                    sprintf_s(address_text, sizeof(address_text), "0x%llX", requested_address);
+                    sprintf_s(base_text, sizeof(base_text), "0x%llX", image.image_base());
+                    return McpRpcErrorResponse(id, MCP_RPC_STATIC_ADDRESS_HAS_NO_DECODABLE_INSTRUCTION_IN_THE_ACTIVE,
+                        std::string("Address ") + address_text + " is not backed by the active static PE " +
+                        WideToUtf8(query.path) + " (preferred image base " + base_text +
+                        "). A resolve_symbol address is a runtime VA; pause the target and use disassemble for loaded module code.");
+                }
+                return McpRpcErrorResponse(id, MCP_RPC_STATIC_ADDRESS_HAS_NO_DECODABLE_INSTRUCTION_IN_THE_ACTIVE);
+            }
+            result += "],\"next_address\":"; JsonAppendHex64(result, address);
+            result += ",\"truncated\":";
+            result += decoded == count ? "false" : "true";
+            if (zero_padding) result += ",\"stop_reason\":\"zero_padding\"";
+            result += '}';
+            return JsonRpcResult(id, result);
+        }
+        return McpRpcErrorResponse(id, MCP_RPC_UNKNOWN_STATIC_TOOL);
+    }
+
+    if (tool == "get_isolation_policy") {
+        std::string policy = "{\"version\":1,\"enforcement\":\"mcp-dispatch-v1\",\"strict\":" + std::string(permission_config.agent_strict ? "true" : "false");
+        policy += ",\"readonly\":" + std::string(permission_config.agent_readonly ? "true" : "false");
+        policy += ",\"require_target\":" + std::string(permission_config.agent_require_target ? "true" : "false");
+        policy += ",\"scope\":"; JsonAppendWide(policy, permission_config.agent_scope);
+        policy += ",\"files\":"; JsonAppendWide(policy, permission_config.agent_files);
+        policy += ",\"network\":"; JsonAppendWide(policy, permission_config.agent_network);
+        return JsonRpcResult(id, policy + '}');
+    }
+    if (tool == "get_event_capabilities")
+        return JsonRpcResult(id, EventCapabilitiesJson(permission_config));
+    if (tool == "get_debug_context") {
+        if (pMcpActiveProcessId)
+            g_debug_feed.update(CurrentDebugProcessId(),
+                pGetcputhreadid ? (DWORD)pGetcputhreadid() : 0,
+                pMcpDebugState ? pMcpDebugState() : pGetstatus ? pGetstatus() : -1);
+        ModelJson context; std::string result = g_debug_feed.context();
+        ModelJson::parse(result, &context);
+        DWORD pid = (DWORD)strtoul(context.get("process_id")->raw.c_str(), NULL, 10);
+        HANDLE snapshot = pid ? CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) : INVALID_HANDLE_VALUE;
+        MODULEENTRY32W module; ZeroMemory(&module, sizeof(module)); module.dwSize = sizeof(module);
+        bool known = snapshot != INVALID_HANDLE_VALUE && Module32FirstW(snapshot, &module) != FALSE;
+        result.resize(result.size() - 1); result += std::string(",\"modules_known\":") + (known ? "true" : "false") + ",\"modules\":[";
+        int count = 0;
+        if (known) do {
+            if (count++) result += ',';
+            result += "{\"base\":"; JsonAppendHex64(result, (unsigned __int64)(ULONG_PTR)module.modBaseAddr);
+            result += ",\"size\":" + DebugRuntimeFeed::number(module.modBaseSize) + ",\"name\":"; JsonAppendWide(result, module.szModule);
+            result += ",\"path\":"; JsonAppendWide(result, module.szExePath); result += '}';
+        } while (count < 128 && Module32NextW(snapshot, &module));
+        if (snapshot != INVALID_HANDLE_VALUE) CloseHandle(snapshot);
+        result += "]}"; return JsonRpcResult(id, result);
+    }
+    if (tool == "wait_debug_event") {
+        ModelJson root;
+        if (!ModelJson::parse(json, &root)) return McpRpcErrorResponse(id, MCP_RPC_INVALID_ARGUMENTS);
+        const ModelJson* params = root.get("params");
+        const ModelJson* args = params ? params->get("arguments") : NULL;
+        const ModelJson* cursor = args ? args->get("cursor") : NULL;
+        const ModelJson* timeout = args ? args->get("timeout_ms") : NULL;
+        if (!cursor || cursor->kind != ModelJson::NUMBER || cursor->raw.find_first_not_of("0123456789") != std::string::npos || cursor->raw.size() > 18 ||
+            (timeout && (timeout->kind != ModelJson::NUMBER || timeout->raw.find_first_not_of("0123456789") != std::string::npos || timeout->raw.size() > 4 || atoi(timeout->raw.c_str()) > 1000)))
+            return McpRpcErrorResponse(id, MCP_RPC_CURSOR_MUST_BE_A_NONNEGATIVE_INTEGER_TIMEOUT_MS_IS_0_1000);
+        return JsonRpcResult(id, g_debug_feed.wait(_strtoui64(cursor->raw.c_str(), NULL, 10), timeout ? atoi(timeout->raw.c_str()) : 1000));
+    }
+    ModelJson runtime_request;
+    if (ModelJson::parse(json, &runtime_request)) {
+        const ModelJson* params = runtime_request.get("params");
+        const ModelJson* meta = params ? params->get("_meta") : NULL;
+        if (meta && (meta->get("z0dbg/target") || meta->get("z0dbg/revision"))) {
+            const ModelJson* expected = meta->get("z0dbg/target"), *revision = meta->get("z0dbg/revision");
+            ModelJson context;
+            if (!ModelJson::parse(g_debug_feed.context(), &context)) return McpRpcErrorResponse(id, MCP_RPC_DEBUG_CONTEXT_UNAVAILABLE);
+            std::string identity = context.get("session")->value + ":" + context.get("process_id")->raw;
+            if (!expected || expected->kind != ModelJson::STRING || expected->value != identity ||
+                (revision && (revision->kind != ModelJson::STRING || revision->value != context.get("revision")->value)))
+                return McpRpcErrorResponse(id, MCP_RPC_DEBUG_TARGET_CONTEXT_CHANGED_BEFORE_DISPATCH_REFRESH_OBSER);
+        }
+    }
 
     unsigned __int64 address = 0, size = 0, index = 0, type_value = 0, count = 0;
     std::string access, hex, text, name, expression, condition, cmdset, key, value, defvalue;
-    JsonFindUInt64(json, "address", address);
-    JsonFindUInt64(json, "addr", address);
-    JsonFindUInt64(json, "size", size);
-    JsonFindUInt64(json, "index", index);
-    JsonFindUInt64(json, "type", type_value);
-    JsonFindUInt64(json, "count", count);
-    JsonFindString(json, "access", access);
-    JsonFindString(json, "hex", hex);
-    JsonFindString(json, "data", hex);
-    JsonFindString(json, "text", text);
-    JsonFindString(json, "assembly", text);
-    JsonFindString(json, "name", name);
-    JsonFindString(json, "expression", expression);
-    JsonFindString(json, "condition", condition);
-    JsonFindString(json, "cmdset", cmdset);
-    JsonFindString(json, "key", key);
-    JsonFindString(json, "value", value);
-    JsonFindString(json, "default", defvalue);
+    std::string argument_json = method == "tools/call" ? (call_arguments ? call_arguments->raw : "{}") : json;
+    JsonFindUInt64(argument_json, "address", address);
+    JsonFindUInt64(argument_json, "addr", address);
+    JsonFindUInt64(argument_json, "size", size);
+    JsonFindUInt64(argument_json, "index", index);
+    JsonFindUInt64(argument_json, "type", type_value);
+    JsonFindUInt64(argument_json, "count", count);
+    JsonFindString(argument_json, "access", access);
+    JsonFindString(argument_json, "hex", hex);
+    JsonFindString(argument_json, "data", hex);
+    JsonFindString(argument_json, "text", text);
+    JsonFindString(argument_json, "assembly", text);
+    JsonFindString(argument_json, "name", name);
+    JsonFindString(argument_json, "expression", expression);
+    JsonFindString(argument_json, "condition", condition);
+    JsonFindString(argument_json, "cmdset", cmdset);
+    JsonFindString(argument_json, "key", key);
+    JsonFindString(argument_json, "value", value);
+    JsonFindString(argument_json, "default", defvalue);
 
     int rc = 0;
     if (tool == "get_status") {
         if (!pGetstatus)
-            return JsonRpcError(id, -32001, "Getstatus is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_GETSTATUS_IS_NOT_AVAILABLE);
         rc = pGetstatus();
     }
     else if (tool == "get_cpu_thread_id") {
         if (!pGetcputhreadid)
-            return JsonRpcError(id, -32001, "Getcputhreadid is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_GETCPUTHREADID_IS_NOT_AVAILABLE);
         std::string result = "{\"ok\":true,\"threadId\":";
         JsonAppendHex64(result, (unsigned __int64)pGetcputhreadid());
         result += "}";
         return JsonRpcResult(id, result);
     }
+    else if (tool == "debug_find_process") {
+        const ModelJson* requested = call_arguments ? call_arguments->get("name") : NULL;
+        if (!requested || requested->kind != ModelJson::STRING || requested->value.empty() || requested->value.size() > 260)
+            return McpRpcErrorResponse(id, MCP_RPC_NAME_MUST_BE_A_BOUNDED_EXECUTABLE_NAME);
+        std::wstring wanted = Utf8ToWide(requested->value);
+        if (wanted.empty() || wanted.find(L'\0') != std::wstring::npos ||
+            wanted.find_first_of(L"\\/:*?\"<>|") != std::wstring::npos)
+            return McpRpcErrorResponse(id, MCP_RPC_NAME_MUST_BE_AN_EXECUTABLE_BASENAME);
+        if (wanted.size() < 4 || _wcsicmp(wanted.c_str() + wanted.size() - 4, L".exe")) wanted += L".exe";
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snapshot == INVALID_HANDLE_VALUE) return McpRpcErrorResponse(id, MCP_RPC_COULD_NOT_ENUMERATE_PROCESSES);
+        PROCESSENTRY32W entry = {}; entry.dwSize = sizeof(entry);
+        std::string result = "{\"processes\":[";
+        unsigned int count = 0;
+        bool more = false;
+        if (Process32FirstW(snapshot, &entry)) do {
+            if (_wcsicmp(entry.szExeFile, wanted.c_str())) continue;
+            if (count == 16) { more = true; break; }
+            if (count++) result += ',';
+            result += "{\"pid\":" + DebugRuntimeFeed::number(entry.th32ProcessID) + ",\"name\":";
+            JsonAppendWide(result, entry.szExeFile); result += '}';
+        } while (Process32NextW(snapshot, &entry));
+        CloseHandle(snapshot);
+        result += "],\"truncated\":" + std::string(more ? "true" : "false") + '}';
+        return JsonRpcResult(id, result);
+    }
+    else if (tool == "debug_open_process") {
+        const ModelJson* args = call_arguments;
+        const ModelJson* path = args ? args->get("path") : NULL;
+        const ModelJson* arguments = args ? args->get("arguments") : NULL;
+        const ModelJson* auto_run = args ? args->get("auto_run") : NULL;
+        if ((!pMcpOpenProcess && !pMcpOpenProcessEx) || !path || path->kind != ModelJson::STRING || path->value.empty() ||
+            path->value.size() > 2048 || (arguments && (arguments->kind != ModelJson::STRING || arguments->value.size() > 4096)) ||
+            (auto_run && auto_run->kind != ModelJson::BOOLEAN))
+            return McpRpcErrorResponse(id, MCP_RPC_PATH_AND_OPTIONAL_ARGUMENTS_MUST_BE_BOUNDED_STRINGS);
+        if (auto_run && auto_run->value == "true" && !pMcpOpenProcessEx)
+            return McpRpcErrorResponse(id, MCP_RPC_OPERATION_REFUSED,
+                "This debugger host does not support debug_open_process auto_run. Update the debugger or open paused and call run after reading get_debug_context.");
+        std::wstring wide_path = Utf8ToWide(path->value);
+        std::wstring wide_arguments = arguments ? Utf8ToWide(arguments->value) : L"";
+        if (wide_path.empty() || wide_path.find(L'\0') != std::wstring::npos ||
+            wide_arguments.find(L'\0') != std::wstring::npos)
+            return McpRpcErrorResponse(id, MCP_RPC_INVALID_EXECUTABLE_PATH_OR_ARGUMENTS);
+        bool run_after_open = auto_run && auto_run->value == "true";
+        int opened = pMcpOpenProcessEx ? pMcpOpenProcessEx(wide_path.c_str(), wide_arguments.c_str(), run_after_open ? 1 : 0) :
+            pMcpOpenProcess(wide_path.c_str(), wide_arguments.c_str());
+        return JsonRpcResult(id, opened ?
+            (run_after_open ? "{\"ok\":true,\"auto_run_requested\":true}" : "{\"ok\":true,\"auto_run_requested\":false}") :
+            "{\"ok\":false}");
+    }
+    else if (tool == "debug_attach_pid") {
+        unsigned __int64 pid = 0;
+        if (!pMcpAttachPid || !JsonFindUInt64(argument_json, "pid", pid) || !pid || pid > 0xFFFFFFFFULL)
+            return McpRpcErrorResponse(id, MCP_RPC_VALID_PID_AND_HOST_ATTACH_BRIDGE_REQUIRED);
+        return JsonRpcResult(id, pMcpAttachPid((unsigned long)pid) ? "{\"ok\":true}" : "{\"ok\":false}");
+    }
+    else if (tool == "debug_stop") {
+        if (!pMcpStopDebug) return McpRpcErrorResponse(id, MCP_RPC_HOST_STOP_BRIDGE_IS_UNAVAILABLE);
+        return JsonRpcResult(id, pMcpStopDebug() ? "{\"ok\":true}" : "{\"ok\":false}");
+    }
+    else if (tool == "register_set") {
+        unsigned __int64 value = 0;
+        if (!pMcpSetRegister || name.empty() || !JsonFindUInt64(argument_json, "value", value))
+            return McpRpcErrorResponse(id, MCP_RPC_REGISTER_NAME_AND_UNSIGNED_VALUE_REQUIRED);
+        return JsonRpcResult(id, pMcpSetRegister(name.c_str(), value) ? "{\"ok\":true}" : "{\"ok\":false}");
+    }
+    else if (tool == "register_get" || tool == "register_list" || tool == "stack_get_pointers") {
+        if (!pMcpGetRegister || !pMcpTargetBits || !pMcpTargetBits())
+            return McpRpcErrorResponse(id, MCP_RPC_REGISTER_CONTEXT_IS_UNAVAILABLE);
+#ifdef _WIN64
+        const char* names64[] = { "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip", "rflags" };
+#else
+        if (pMcpTargetBits() != 32) return McpRpcErrorResponse(id, MCP_RPC_UNSUPPORTED_TARGET_ARCHITECTURE);
+#endif
+        const char* names32[] = { "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi", "eip", "eflags" };
+        bool is64 = pMcpTargetBits() == 64;
+#ifdef _WIN64
+        const char** names = is64 ? names64 : names32;
+        size_t name_count = is64 ? _countof(names64) : _countof(names32);
+#else
+        const char** names = names32;
+        size_t name_count = _countof(names32);
+#endif
+        const char* stack_names64[] = { "rsp", "rbp" };
+        const char* stack_names32[] = { "esp", "ebp" };
+        const char** stack_names = is64 ? stack_names64 : stack_names32;
+        std::string result = "{\"ok\":true,\"registers\":{";
+        size_t selected = tool == "register_get" ? 1 : tool == "stack_get_pointers" ? 2 : name_count;
+        bool found = false;
+        for (size_t i = 0; i < selected; ++i) {
+            const char* reg = tool == "register_get" ? name.c_str() : tool == "stack_get_pointers" ? stack_names[i] : names[i];
+            bool allowed = false;
+            for (size_t k = 0; k < name_count; ++k) if (_stricmp(reg, names[k]) == 0) allowed = true;
+            if (!allowed) return McpRpcErrorResponse(id, MCP_RPC_UNSUPPORTED_REGISTER_NAME);
+            unsigned __int64 number = 0;
+            if (!pMcpGetRegister(reg, &number)) {
+                if (tool == "register_get" || tool == "stack_get_pointers")
+                    return McpRpcErrorResponse(id, MCP_RPC_REGISTER_VALUE_IS_UNAVAILABLE);
+                continue;
+            }
+            if (found) result += ',';
+            JsonAppendEscaped(result, reg);
+            result += ':';
+            JsonAppendHex64(result, number);
+            found = true;
+        }
+        result += "}}";
+        if (!found) return McpRpcErrorResponse(id, MCP_RPC_REGISTER_VALUES_ARE_UNAVAILABLE);
+        return JsonRpcResult(id, result);
+    }
+    else if (tool == "stack_read") {
+        if (!address || !size || size > 65536 || !pReadmemory ||
+            address > (unsigned __int64)(ULONG_PTR)~(ULONG_PTR)0 ||
+            size - 1 > (unsigned __int64)(ULONG_PTR)~(ULONG_PTR)0 - address)
+            return McpRpcErrorResponse(id, MCP_RPC_STACK_READ_REQUIRES_ADDRESS_AND_SIZE_65536);
+        std::vector<uchar> bytes((size_t)size);
+        ulong read = pReadmemory(&bytes[0], (ulong)address, (ulong)size, MM_SILENT);
+        if (read > size) return McpRpcErrorResponse(id, MCP_RPC_HOST_RETURNED_AN_INVALID_READ_LENGTH);
+        std::string result = "{\"ok\":true,\"read\":" + DebugRuntimeFeed::number(read) + ",\"hex\":";
+        std::string hex = BytesToHex(&bytes[0], read);
+        JsonAppendEscaped(result, hex.c_str());
+        return JsonRpcResult(id, result + '}');
+    }
+    else if (tool == "thread_list" || tool == "thread_get") {
+        unsigned __int64 offset = 0, limit = 16;
+        if (tool == "thread_list" && !ListPageArguments(argument_json, 16, offset, limit))
+            return McpRpcErrorResponse(id, MCP_RPC_OFFSET_MUST_BE_0_65535_AND_LIMIT_1_64);
+        DWORD pid = g_host_process_id && *g_host_process_id ? (DWORD)*g_host_process_id : g_observed_process_id;
+        if (!pid) return McpRpcErrorResponse(id, MCP_RPC_NO_DEBUG_TARGET);
+        unsigned __int64 requested = 0;
+        if (tool == "thread_get" && (!JsonFindUInt64(argument_json, "thread_id", requested) || !requested || requested > 0xFFFFFFFFULL))
+            return McpRpcErrorResponse(id, MCP_RPC_VALID_THREAD_ID_REQUIRED);
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snapshot == INVALID_HANDLE_VALUE) return McpRpcErrorResponse(id, MCP_RPC_THREAD_SNAPSHOT_FAILED);
+        THREADENTRY32 entry; ZeroMemory(&entry, sizeof(entry)); entry.dwSize = sizeof(entry);
+        std::string result = "{\"ok\":true,\"threads\":[";
+        unsigned __int64 count = 0, seen = 0;
+        bool more = false;
+        if (Thread32First(snapshot, &entry)) do {
+            if (entry.th32OwnerProcessID != pid || (requested && entry.th32ThreadID != requested)) continue;
+            if (!requested && seen++ < offset) continue;
+            if (!requested && count >= limit) { more = true; break; }
+            if (count++) result += ',';
+            result += "{\"thread_id\":" + DebugRuntimeFeed::number(entry.th32ThreadID);
+            result += ",\"base_priority\":" + DebugRuntimeFeed::state_number(entry.tpBasePri);
+            result += ",\"current\":";
+            result += pGetcputhreadid && pGetcputhreadid() == entry.th32ThreadID ? "true}" : "false}";
+            if (requested) break;
+        } while (Thread32Next(snapshot, &entry));
+        CloseHandle(snapshot);
+        result += "],\"next_offset\":";
+        result += more ? DebugRuntimeFeed::number(offset + count) : "null";
+        result += '}';
+        if (requested && !count) return McpRpcErrorResponse(id, MCP_RPC_THREAD_NOT_FOUND_IN_TARGET);
+        return JsonRpcResult(id, result);
+    }
+    else if (tool == "module_list" || tool == "module_get") {
+        unsigned __int64 offset = 0, limit = 8;
+        if (tool == "module_list" && !ListPageArguments(argument_json, 8, offset, limit))
+            return McpRpcErrorResponse(id, MCP_RPC_OFFSET_MUST_BE_0_65535_AND_LIMIT_1_64);
+        DWORD pid = g_host_process_id && *g_host_process_id ? (DWORD)*g_host_process_id : g_observed_process_id;
+        if (!pid) return McpRpcErrorResponse(id, MCP_RPC_NO_DEBUG_TARGET);
+        if (tool == "module_get" && (!address || address > (unsigned __int64)(ULONG_PTR)~(ULONG_PTR)0))
+            return McpRpcErrorResponse(id, MCP_RPC_VALID_ADDRESS_REQUIRED);
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+        if (snapshot == INVALID_HANDLE_VALUE) return McpRpcErrorResponse(id, MCP_RPC_MODULE_SNAPSHOT_FAILED);
+        MODULEENTRY32W entry; ZeroMemory(&entry, sizeof(entry)); entry.dwSize = sizeof(entry);
+        std::string result = "{\"ok\":true,\"modules\":[";
+        unsigned __int64 count = 0, seen = 0;
+        bool more = false;
+        if (Module32FirstW(snapshot, &entry)) do {
+            unsigned __int64 base = (unsigned __int64)(ULONG_PTR)entry.modBaseAddr;
+            if (tool == "module_get" && (address < base || address - base >= entry.modBaseSize)) continue;
+            if (tool == "module_list" && seen++ < offset) continue;
+            if (tool == "module_list" && count >= limit) { more = true; break; }
+            std::string item = "{\"base\":"; JsonAppendHex64(item, base);
+            item += ",\"size\":" + DebugRuntimeFeed::number(entry.modBaseSize) + ",\"name\":";
+            JsonAppendWide(item, entry.szModule);
+            item += ",\"path\":"; JsonAppendWide(item, entry.szExePath);
+            item += '}';
+            if (tool == "module_list" && count && result.size() + item.size() > 7000) { more = true; break; }
+            if (count++) result += ',';
+            result += item;
+            if (tool == "module_get") break;
+        } while (Module32NextW(snapshot, &entry));
+        CloseHandle(snapshot);
+        result += "],\"next_offset\":";
+        result += more ? DebugRuntimeFeed::number(offset + count) : "null";
+        result += '}';
+        if (tool == "module_get" && !count) return McpRpcErrorResponse(id, MCP_RPC_MODULE_NOT_FOUND);
+        return JsonRpcResult(id, result);
+    }
+    else if (tool == "breakpoint_list") {
+        if (!pGetnextbreakpoint) return McpRpcErrorResponse(id, MCP_RPC_BREAKPOINT_ENUMERATION_UNAVAILABLE);
+        unsigned __int64 offset = 0, limit = 16;
+        if (!ListPageArguments(argument_json, 16, offset, limit))
+            return McpRpcErrorResponse(id, MCP_RPC_OFFSET_MUST_BE_0_65535_AND_LIMIT_1_64);
+        std::string result = "{\"ok\":true,\"breakpoints\":[";
+        ulong previous = 0;
+        unsigned __int64 count = 0, seen = 0;
+        bool more = false;
+        for (; seen <= offset + limit; ) {
+            ulong type = 0; int command = 0;
+            ulong next = pGetnextbreakpoint(previous, &type, &command);
+            if (!next || next <= previous) break;
+            previous = next;
+            if (seen++ < offset) continue;
+            if (count >= limit) { more = true; break; }
+            if (count) result += ',';
+            result += "{\"address\":"; JsonAppendHex64(result, next);
+            result += ",\"type\":" + DebugRuntimeFeed::number(type) + '}';
+            ++count;
+        }
+        result += "],\"next_offset\":";
+        result += more ? DebugRuntimeFeed::number(offset + count) : "null";
+        result += '}';
+        return JsonRpcResult(id, result);
+    }
+    else if (tool == "dump_memory_region") {
+        std::string output_path;
+        if (!pReadmemory || !address || !size || size > 16 * 1024 * 1024 ||
+            address > (unsigned __int64)(ULONG_PTR)~(ULONG_PTR)0 ||
+            size - 1 > (unsigned __int64)(ULONG_PTR)~(ULONG_PTR)0 - address ||
+            !JsonFindString(argument_json, "output_path", output_path) || output_path.empty())
+            return McpRpcErrorResponse(id, MCP_RPC_ADDRESS_SIZE_16_MB_AND_OUTPUT_PATH_REQUIRED);
+        std::wstring path = Utf8ToWide(output_path);
+        if (path.size() < 4 || path[1] != L':' || path[2] != L'\\')
+            return McpRpcErrorResponse(id, MCP_RPC_OUTPUT_PATH_MUST_BE_AN_ABSOLUTE_LOCAL_PATH);
+        std::vector<uchar> bytes((size_t)size);
+        ulong read = pReadmemory(&bytes[0], (ulong)address, (ulong)size, MM_SILENT);
+        if (read != size) return McpRpcErrorResponse(id, MCP_RPC_COULD_NOT_READ_THE_ENTIRE_MEMORY_REGION);
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (file == INVALID_HANDLE_VALUE) return McpRpcErrorResponse(id, MCP_RPC_COULD_NOT_CREATE_OUTPUT_FILE_EXISTING_FILES_ARE_NOT_OVERWR);
+        DWORD written = 0;
+        BOOL saved = WriteFile(file, &bytes[0], (DWORD)size, &written, NULL);
+        CloseHandle(file);
+        if (!saved || written != size) {
+            DeleteFileW(path.c_str());
+            return McpRpcErrorResponse(id, MCP_RPC_MEMORY_DUMP_WRITE_WAS_INCOMPLETE);
+        }
+        std::string result = "{\"ok\":true,\"bytes\":" + DebugRuntimeFeed::number(written) + ",\"path\":";
+        JsonAppendEscaped(result, output_path.c_str());
+        return JsonRpcResult(id, result + '}');
+    }
     else if (tool == "run")
     {
         if (!pRun)
-            return JsonRpcError(id, -32001, "Run is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_RUN_IS_NOT_AVAILABLE);
         rc = pRun(STAT_RUNNING, 0);
     }
     else if (tool == "go")
     {
         if (!pGo)
-            return JsonRpcError(id, -32001, "Go is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_GO_IS_NOT_AVAILABLE);
         if (!pGetcputhreadid)
-            return JsonRpcError(id, -32001, "Getcputhreadid is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_GETCPUTHREADID_IS_NOT_AVAILABLE);
         rc = pGo(pGetcputhreadid(), (ulong)address, 0, 0, 0);
     }
     else if (tool == "pause")
     {
         if (!pSuspendprocess)
-            return JsonRpcError(id, -32001, "Suspendprocess is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_SUSPENDPROCESS_IS_NOT_AVAILABLE);
         rc = pSuspendprocess(0);
     }
     else if (tool == "step_into")
     {
         if (!pRun)
-            return JsonRpcError(id, -32001, "Run is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_RUN_IS_NOT_AVAILABLE);
         rc = pRun(STAT_STEPIN, 0);
     }
     else if (tool == "step_over")
     {
         if (!pRun)
-            return JsonRpcError(id, -32001, "Run is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_RUN_IS_NOT_AVAILABLE);
         rc = pRun(STAT_STEPOVER, 0);
     }
     else if (tool == "trace_into")
     {
         if (!pRun)
-            return JsonRpcError(id, -32001, "Run is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_RUN_IS_NOT_AVAILABLE);
         rc = pRun(STAT_TRACEIN, 0);
     }
     else if (tool == "trace_over")
     {
         if (!pRun)
-            return JsonRpcError(id, -32001, "Run is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_RUN_IS_NOT_AVAILABLE);
         rc = pRun(STAT_TRACEOVER, 0);
     }
     else if (tool == "auto_step_into")
     {
         if (!pRun)
-            return JsonRpcError(id, -32001, "Run is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_RUN_IS_NOT_AVAILABLE);
         rc = pRun(STAT_ANIMIN, 0);
     }
     else if (tool == "auto_step_over")
     {
         if (!pRun)
-            return JsonRpcError(id, -32001, "Run is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_RUN_IS_NOT_AVAILABLE);
         rc = pRun(STAT_ANIMOVER, 0);
     }
     else if (tool == "close_process")
-        return JsonRpcError(id, -32601, "close_process is not exported by current debugger SDK");
+        return McpRpcErrorResponse(id, MCP_RPC_CLOSE_PROCESS_IS_NOT_EXPORTED_BY_CURRENT_DEBUGGER_SDK);
     else if (tool == "list_memory")
     {
         if (!pListmemory)
-            return JsonRpcError(id, -32001, "Listmemory is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_LISTMEMORY_IS_NOT_AVAILABLE);
         rc = pListmemory();
     }
     else if (tool == "find_memory") {
         if (!pFindmemory)
-            return JsonRpcError(id, -32001, "Findmemory is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_FINDMEMORY_IS_NOT_AVAILABLE);
         t_memory* mem = pFindmemory((ulong)address);
         if (!mem)
             return JsonRpcResult(id, "{\"ok\":false}");
@@ -2891,7 +4001,7 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "find_data_ptr") {
         if (!pFinddataptr)
-            return JsonRpcError(id, -32001, "Finddataptr is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_FINDDATAPTR_IS_NOT_AVAILABLE);
         ulong datasize = 0;
         void* ptr = pFinddataptr((ulong)address, (int)type_value, &datasize);
         std::string result = "{\"ok\":";
@@ -2905,11 +4015,12 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "read_memory") {
         if (!address || !size || size > 1024 * 1024)
-            return JsonRpcError(id, -32602, "read_memory requires address and size <= 1MB");
+            return McpRpcErrorResponse(id, MCP_RPC_READ_MEMORY_REQUIRES_ADDRESS_AND_SIZE_1MB);
         std::vector<uchar> buf((size_t)size);
         if (!pReadmemory)
-            return JsonRpcError(id, -32001, "Readmemory is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_READMEMORY_IS_NOT_AVAILABLE);
         ulong read = pReadmemory(buf.data(), (ulong)address, (ulong)size, MM_SILENT);
+        if (read > size) return McpRpcErrorResponse(id, MCP_RPC_HOST_RETURNED_AN_INVALID_READ_LENGTH);
         std::string result = "{\"ok\":true,\"read\":";
         char num[32];
         StringCchPrintfA(num, _countof(num), "%llu", (unsigned long long)read);
@@ -2922,13 +4033,31 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "write_memory") {
         if (!address || hex.empty())
-            return JsonRpcError(id, -32602, "write_memory requires address and hex/data");
+            return McpRpcErrorResponse(id, MCP_RPC_WRITE_MEMORY_REQUIRES_ADDRESS_AND_HEX_DATA);
+        size_t digits = 0;
+        for (size_t i = 0; i < hex.size(); ++i) {
+            if (HexDigit(hex[i]) >= 0) ++digits;
+            else if (hex[i] != ' ' && hex[i] != '\t' && hex[i] != '\r' && hex[i] != '\n')
+                return McpRpcErrorResponse(id, MCP_RPC_WRITE_MEMORY_HEX_CONTAINS_INVALID_DIGITS);
+        }
+        if (!digits || digits % 2) return McpRpcErrorResponse(id, MCP_RPC_WRITE_MEMORY_REQUIRES_COMPLETE_HEXADECIMAL_BYTE_PAIRS);
         std::vector<uchar> buf = HexToBytes(hex);
         if (!pWritememory)
-            return JsonRpcError(id, -32001, "Writememory is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_WRITEMEMORY_IS_NOT_AVAILABLE);
+        ModelJson args; ModelJson::parse(argument_json, &args);
+        const ModelJson* expected = args.get("expected_hex");
+        if (expected) {
+            if (expected->kind != ModelJson::STRING || expected->value.empty() || expected->value.size() != buf.size() * 2 || buf.size() > 4096)
+                return McpRpcErrorResponse(id, MCP_RPC_EXPECTED_HEX_MUST_CONTAIN_EXACT_HEXADECIMAL_PAIRS_FOR_4096);
+            for (size_t i = 0; i < expected->value.size(); ++i) if (HexDigit(expected->value[i]) < 0)
+                return McpRpcErrorResponse(id, MCP_RPC_EXPECTED_HEX_CONTAINS_INVALID_HEXADECIMAL_DIGITS);
+            std::vector<uchar> before(buf.size()), wanted = HexToBytes(expected->value);
+            if (!pReadmemory || pReadmemory(before.data(), (ulong)address, (ulong)before.size(), MM_SILENT) != before.size() || before != wanted)
+                return McpRpcErrorResponse(id, MCP_RPC_MEMORY_CHANGED_SINCE_SNAPSHOT_CONDITIONAL_WRITE_REFUSED);
+        }
         ulong written = buf.empty() ? 0 : pWritememory(buf.data(), (ulong)address, (ulong)buf.size(), MM_SILENT);
         char num[32];
-        std::string result = "{\"ok\":true,\"written\":";
+        std::string result = written == buf.size() && !buf.empty() ? "{\"ok\":true,\"written\":" : "{\"ok\":false,\"written\":";
         StringCchPrintfA(num, _countof(num), "%llu", (unsigned long long)written);
         result += num;
         result += "}";
@@ -2936,31 +4065,31 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "set_software_breakpoint") {
         if (!pSetbreakpoint)
-            return JsonRpcError(id, -32001, "Setbreakpoint is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_SETBREAKPOINT_IS_NOT_AVAILABLE);
         rc = pSetbreakpoint((ulong)address, BP_MANUAL | BP_BREAK, 0);
     }
     else if (tool == "set_software_breakpoint_ext") {
         if (!pSetbreakpointext)
-            return JsonRpcError(id, -32001, "Setbreakpointext is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_SETBREAKPOINTEXT_IS_NOT_AVAILABLE);
         rc = pSetbreakpointext((ulong)address, BP_MANUAL | BP_BREAK, 0, (ulong)count);
     }
     else if (tool == "delete_software_breakpoint") {
         if (!pDeletebreakpoints)
-            return JsonRpcError(id, -32001, "Deletebreakpoints is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_DELETEBREAKPOINTS_IS_NOT_AVAILABLE);
         pDeletebreakpoints((ulong)address, (ulong)address + 1, 1);
         rc = 0;
     }
     else if (tool == "delete_breakpoint_range") {
         if (!size)
-            return JsonRpcError(id, -32602, "delete_breakpoint_range requires address and size");
+            return McpRpcErrorResponse(id, MCP_RPC_DELETE_BREAKPOINT_RANGE_REQUIRES_ADDRESS_AND_SIZE);
         if (!pDeletebreakpoints)
-            return JsonRpcError(id, -32001, "Deletebreakpoints is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_DELETEBREAKPOINTS_IS_NOT_AVAILABLE);
         pDeletebreakpoints((ulong)address, (ulong)(address + size), 1);
         rc = 0;
     }
     else if (tool == "delete_all_breakpoints") {
         if (!pDeletebreakpoints)
-            return JsonRpcError(id, -32001, "Deletebreakpoints is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_DELETEBREAKPOINTS_IS_NOT_AVAILABLE);
         pDeletebreakpoints(0, ~(ulong)0, 1);
         rc = 0;
     }
@@ -2968,38 +4097,38 @@ static std::string ExecuteToolCommand(const std::string& json)
         if (!size)
             size = 1;
         if (!pSetmembreakpointSimple)
-            return JsonRpcError(id, -32001, "Setmembreakpoint is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_SETMEMBREAKPOINT_IS_NOT_AVAILABLE);
         rc = pSetmembreakpointSimple((int)BreakAccessFromText(access, BP_READ | BP_WRITE), (ulong)address, (ulong)size);
     }
     else if (tool == "delete_memory_breakpoint") {
         if (!pRemovemembreakpoint)
-            return JsonRpcError(id, -32001, "Removemembreakpoint is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_REMOVEMEMBREAKPOINT_IS_NOT_AVAILABLE);
         rc = pRemovemembreakpoint((ulong)address);
     }
     else if (tool == "set_hardware_breakpoint") {
         if (!size)
             size = 1;
         if (!pSethardwarebreakpoint)
-            return JsonRpcError(id, -32001, "Sethardwarebreakpoint is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_SETHARDWAREBREAKPOINT_IS_NOT_AVAILABLE);
         rc = pSethardwarebreakpoint((ulong)address, (int)size, (int)(BreakAccessFromText(access, BP_EXEC) | BP_MANUAL | BP_BREAK));
     }
     else if (tool == "delete_hardware_breakpoint") {
         if (address)
         {
             if (!pDeletehardwarebreakbyaddr)
-                return JsonRpcError(id, -32001, "Deletehardwarebreakbyaddr is not available");
+                return McpRpcErrorResponse(id, MCP_RPC_DELETEHARDWAREBREAKBYADDR_IS_NOT_AVAILABLE);
             rc = pDeletehardwarebreakbyaddr((ulong)address);
         }
         else
         {
             if (!pDeletehardwarebreakpoint)
-                return JsonRpcError(id, -32001, "Deletehardwarebreakpoint is not available");
+                return McpRpcErrorResponse(id, MCP_RPC_DELETEHARDWAREBREAKPOINT_IS_NOT_AVAILABLE);
             rc = pDeletehardwarebreakpoint((int)index);
         }
     }
     else if (tool == "get_breakpoint_type") {
         if (!pGetbreakpointtype)
-            return JsonRpcError(id, -32001, "Getbreakpointtype is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_GETBREAKPOINTTYPE_IS_NOT_AVAILABLE);
         ulong typ = pGetbreakpointtype((ulong)address);
         char num[32];
         std::string result = "{\"ok\":true,\"type\":";
@@ -3010,7 +4139,7 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "get_breakpoint_type_count") {
         if (!pGetbreakpointtypecount)
-            return JsonRpcError(id, -32001, "Getbreakpointtypecount is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_GETBREAKPOINTTYPECOUNT_IS_NOT_AVAILABLE);
         ulong passcount = 0;
         ulong typ = pGetbreakpointtypecount((ulong)address, &passcount);
         std::string result = "{\"ok\":true,\"type\":";
@@ -3022,7 +4151,7 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "get_next_breakpoint") {
         if (!pGetnextbreakpoint)
-            return JsonRpcError(id, -32001, "Getnextbreakpoint is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_GETNEXTBREAKPOINT_IS_NOT_AVAILABLE);
         ulong typ = 0;
         int cmd = 0;
         ulong next = pGetnextbreakpoint((ulong)address, &typ, &cmd);
@@ -3041,44 +4170,44 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "set_temp_breakpoint") {
         if (!pTempbreakpoint)
-            return JsonRpcError(id, -32001, "Tempbreakpoint is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_TEMPBREAKPOINT_IS_NOT_AVAILABLE);
         pTempbreakpoint((ulong)address, (int)type_value);
         return JsonRpcResult(id, "{\"ok\":true}");
     }
     else if (tool == "plugin_temp_breakpoint") {
         if (!pPlugintempbreakpoint)
-            return JsonRpcError(id, -32001, "Plugintempbreakpoint is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_PLUGINTEMPBREAKPOINT_IS_NOT_AVAILABLE);
         rc = pPlugintempbreakpoint((ulong)address, (int)type_value, (int)BreakAccessFromText(access, BP_EXEC), (int)size, 1);
     }
     else if (tool == "disassemble") {
         uchar cmd[32] = { 0 };
         if (!pReadmemory || !pDisasm)
-            return JsonRpcError(id, -32001, "Disasm is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_DISASM_IS_NOT_AVAILABLE);
         ulong read = pReadmemory(cmd, (ulong)address, sizeof(cmd), MM_SILENT);
         if (!read)
-            return JsonRpcError(id, -32000, "failed to read instruction bytes");
-        t_disasm da;
+            return McpRpcErrorResponse(id, MCP_RPC_FAILED_TO_READ_INSTRUCTION_BYTES);
+        HostDisasm da;
         ZeroMemory(&da, sizeof(da));
-        ulong len = pDisasm(cmd, read, (ulong)address, NULL, &da, 0, NULL, NULL);
+        ulong len = pDisasm(cmd, read, (ulong)address, NULL, &da, 0, 0);
         std::string result = "{\"ok\":true,\"size\":";
         char num[32];
         StringCchPrintfA(num, _countof(num), "%llu", (unsigned long long)len);
         result += num;
         result += ",\"text\":";
-        JsonAppendWide(result, da.result);
+        JsonAppendEscaped(result, da.result);
         result += ",\"dump\":";
-        JsonAppendWide(result, da.dump);
+        JsonAppendEscaped(result, da.dump);
         result += "}";
         return JsonRpcResult(id, result);
     }
     else if (tool == "assemble") {
         if (text.empty())
-            return JsonRpcError(id, -32602, "assemble requires text/assembly");
+            return McpRpcErrorResponse(id, MCP_RPC_ASSEMBLE_REQUIRES_TEXT_ASSEMBLY);
         uchar buf[32] = { 0 };
         wchar_t err[TEXTLEN] = { 0 };
         std::wstring wtext = Utf8ToWide(text);
         if (!pAssemble)
-            return JsonRpcError(id, -32001, "Assemble is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_ASSEMBLE_IS_NOT_AVAILABLE);
         ulong n = pAssemble((wchar_t*)wtext.c_str(), (ulong)address, buf, sizeof(buf), 0, err);
         if (!n) {
             std::string e = "assemble failed";
@@ -3099,27 +4228,27 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "set_cpu") {
         if (!pSetcpu || !pGetcputhreadid)
-            return JsonRpcError(id, -32001, "Setcpu is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_SETCPU_IS_NOT_AVAILABLE);
         pSetcpu(pGetcputhreadid(), (ulong)address, 0, 0, 0, CPU_ASMHIST | CPU_ASMCENTER | CPU_ASMFOCUS | CPU_REDRAW);
         return JsonRpcResult(id, "{\"ok\":true}");
     }
     else if (tool == "set_disasm") {
         if (!pSetdisasm)
-            return JsonRpcError(id, -32001, "Setdisasm is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_SETDISASM_IS_NOT_AVAILABLE);
         pSetdisasm((ulong)address, (ulong)size, (int)type_value);
         return JsonRpcResult(id, "{\"ok\":true}");
     }
     else if (tool == "evaluate") {
         if (!pExpressionA)
-            return JsonRpcError(id, -32001, "Expression is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_EXPRESSION_IS_NOT_AVAILABLE);
         if (expression.empty())
             expression = text;
         if (expression.empty())
-            return JsonRpcError(id, -32602, "evaluate requires expression");
+            return McpRpcErrorResponse(id, MCP_RPC_EVALUATE_REQUIRES_EXPRESSION);
         Z0B_RESULT res;
         ZeroMemory(&res, sizeof(res));
         if (!pGetcputhreadid)
-            return JsonRpcError(id, -32001, "Getcputhreadid is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_GETCPUTHREADID_IS_NOT_AVAILABLE);
         int ok = pExpressionA(&res, (char*)expression.c_str(), 0, 0, NULL, 0, 0, pGetcputhreadid());
         std::string result = "{\"ok\":";
         result += ok ? "true" : "false";
@@ -3130,9 +4259,40 @@ static std::string ExecuteToolCommand(const std::string& json)
         result += "}";
         return JsonRpcResult(id, result);
     }
+    else if (tool == "resolve_symbol") {
+        if (name.empty() || name.size() >= TEXTLEN)
+            return McpRpcErrorResponse(id, MCP_RPC_RESOLVE_SYMBOL_REQUIRES_A_SYMBOL_NAME);
+        unsigned __int64 symbol_address = 0;
+        bool paused = pMcpDebugState ? pMcpDebugState() == STAT_PAUSED :
+            pGetstatus && pGetstatus() == STAT_PAUSED;
+        if (paused && pExpressionA && pGetcputhreadid) {
+            Z0B_RESULT resolved;
+            ZeroMemory(&resolved, sizeof(resolved));
+            if (pExpressionA(&resolved, (char*)name.c_str(), 0, 0, NULL, 0, 0, pGetcputhreadid())) {
+                char* end = NULL;
+                unsigned __int64 value = _strtoui64(resolved.value, &end, 16);
+                if (value && end && *end == 0) symbol_address = value;
+            }
+        }
+        bool from_export = false;
+        if (!symbol_address) {
+            symbol_address = ResolveLoadedModuleExport(CurrentDebugProcessId(), name);
+            from_export = symbol_address != 0;
+        }
+        std::string result = "{\"ok\":";
+        result += symbol_address ? "true" : "false";
+        result += ",\"address\":";
+        JsonAppendHex64(result, symbol_address);
+        result += ",\"source\":\"";
+        result += symbol_address ? (from_export ? "module_export" : "debugger_symbol") : "unresolved";
+        result += "\"";
+        result += ",\"address_space\":\"runtime_va\"";
+        result += "}";
+        return JsonRpcResult(id, result);
+    }
     else if (tool == "find_name") {
         if (!pFindnameA)
-            return JsonRpcError(id, -32001, "Findname is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_FINDNAME_IS_NOT_AVAILABLE);
         char buf[TEXTLEN] = { 0 };
         int n = pFindnameA((ulong)address, (int)type_value, buf);
         std::string result = "{\"ok\":";
@@ -3144,14 +4304,14 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "insert_name") {
         if (!pInsertnameA)
-            return JsonRpcError(id, -32001, "Insertname is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_INSERTNAME_IS_NOT_AVAILABLE);
         if (name.empty())
             name = text;
         rc = pInsertnameA((ulong)address, (int)type_value, (char*)name.c_str());
     }
     else if (tool == "decode_address") {
         if (!pDecodeaddressA)
-            return JsonRpcError(id, -32001, "Decodeaddress is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_DECODEADDRESS_IS_NOT_AVAILABLE);
         char symbol[TEXTLEN] = { 0 };
         char comment[TEXTLEN] = { 0 };
         int n = pDecodeaddressA((ulong)address, 0, (int)type_value, symbol, TEXTLEN, comment);
@@ -3166,7 +4326,7 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "decode_name") {
         if (!pDecodenameA)
-            return JsonRpcError(id, -32001, "Decodename is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_DECODENAME_IS_NOT_AVAILABLE);
         char buf[TEXTLEN] = { 0 };
         int n = pDecodenameA((ulong)address, (int)type_value, buf);
         std::string result = "{\"ok\":";
@@ -3178,7 +4338,7 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "comment_address") {
         if (!pCommentaddressW)
-            return JsonRpcError(id, -32001, "Commentaddress is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_COMMENTADDRESS_IS_NOT_AVAILABLE);
         wchar_t buf[TEXTLEN] = { 0 };
         int n = pCommentaddressW((ulong)address, (int)(type_value ? type_value : 0xFFFFFFFF), buf, _countof(buf));
         std::string result = "{\"ok\":";
@@ -3190,7 +4350,7 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "simple_address") {
         if (!pSimpleaddressW)
-            return JsonRpcError(id, -32001, "Simpleaddress is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_SIMPLEADDRESS_IS_NOT_AVAILABLE);
         wchar_t buf[TEXTLEN] = { 0 };
         uchar mask[TEXTLEN] = { 0 };
         int select = 0;
@@ -3208,7 +4368,7 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "find_label") {
         if (!pFindlabelA)
-            return JsonRpcError(id, -32001, "Findlabel is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_FINDLABEL_IS_NOT_AVAILABLE);
         char buf[TEXTLEN] = { 0 };
         int n = pFindlabelA((ulong)address, buf);
         std::string result = "{\"ok\":";
@@ -3220,7 +4380,7 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "find_module") {
         if (!pFindmodule)
-            return JsonRpcError(id, -32001, "Findmodule is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_FINDMODULE_IS_NOT_AVAILABLE);
         Z0B_MODULE* mod = pFindmodule((ulong)address);
         if (!mod)
             return JsonRpcResult(id, "{\"ok\":false}");
@@ -3239,9 +4399,9 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "find_thread") {
         if (!pFindthread)
-            return JsonRpcError(id, -32001, "Findthread is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_FINDTHREAD_IS_NOT_AVAILABLE);
         if (!pGetcputhreadid)
-            return JsonRpcError(id, -32001, "Getcputhreadid is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_GETCPUTHREADID_IS_NOT_AVAILABLE);
         void* th = pFindthread((ulong)(address ? address : pGetcputhreadid()));
         std::string result = "{\"ok\":";
         result += th ? "true" : "false";
@@ -3252,10 +4412,10 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "find_data") {
         if (!pFinddataA)
-            return JsonRpcError(id, -32001, "Finddata is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_FINDDATA_IS_NOT_AVAILABLE);
         std::vector<uchar> buf = HexToBytes(hex);
         if (buf.empty())
-            return JsonRpcError(id, -32602, "find_data requires hex/data");
+            return McpRpcErrorResponse(id, MCP_RPC_FIND_DATA_REQUIRES_HEX_DATA);
         ulong found = pFinddataA((ulong)address, (int)type_value, buf.data(), (ulong)buf.size());
         std::string result = "{\"ok\":true,\"address\":";
         JsonAppendHex64(result, found);
@@ -3264,7 +4424,7 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "find_decode") {
         if (!pFinddecodeA)
-            return JsonRpcError(id, -32001, "Finddecode is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_FINDDECODE_IS_NOT_AVAILABLE);
         ulong decoded_size = 0;
         char* decoded = pFinddecodeA((ulong)address, &decoded_size);
         std::string result = "{\"ok\":";
@@ -3278,38 +4438,38 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "find_strings") {
         if (!pFindstringsA)
-            return JsonRpcError(id, -32001, "Findstrings is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_FINDSTRINGS_IS_NOT_AVAILABLE);
         if (!size)
-            return JsonRpcError(id, -32602, "find_strings requires base/address and size");
+            return McpRpcErrorResponse(id, MCP_RPC_FIND_STRINGS_REQUIRES_BASE_ADDRESS_AND_SIZE);
         rc = pFindstringsA((ulong)address, (ulong)size, 0, (char*)(text.empty() ? "MCP strings" : text.c_str()));
     }
     else if (tool == "find_references") {
         if (!pFindreferencesA)
-            return JsonRpcError(id, -32001, "Findreferences is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_FINDREFERENCES_IS_NOT_AVAILABLE);
         unsigned __int64 target0 = 0, target1 = 0;
-        JsonFindUInt64(json, "target", target0);
-        JsonFindUInt64(json, "target0", target0);
-        JsonFindUInt64(json, "target1", target1);
+        JsonFindUInt64(argument_json, "target", target0);
+        JsonFindUInt64(argument_json, "target1", target1);
         if (!size || !target0)
-            return JsonRpcError(id, -32602, "find_references requires base/address, size and target");
+            return McpRpcErrorResponse(id, MCP_RPC_FIND_REFERENCES_REQUIRES_BASE_ADDRESS_SIZE_AND_TARGET);
         rc = pFindreferencesA((ulong)address, (ulong)size, (ulong)target0, (ulong)target1, 0, 0, (char*)(text.empty() ? "MCP references" : text.c_str()));
     }
     else if (tool == "find_import_by_name") {
-        if (!pFindimportbynameA)
-            return JsonRpcError(id, -32001, "Findimportbyname is not available");
         if (name.empty())
             name = text;
-        ulong found = pFindimportbynameA((char*)name.c_str(), (ulong)address, (ulong)(size ? address + size : 0));
+        unsigned __int64 found = FindLoadedMainImport(CurrentDebugProcessId(), name, address, size);
         std::string result = "{\"ok\":";
         result += found ? "true" : "false";
         result += ",\"address\":";
-        JsonAppendHex64(result, (unsigned __int64)found);
+        JsonAppendHex64(result, found);
+        result += ",\"source\":\"";
+        result += found ? "main_executable_import" : "unresolved";
+        result += "\"";
         result += "}";
         return JsonRpcResult(id, result);
     }
     else if (tool == "find_file_offset") {
         if (!pFindmodule || !pFindfileoffset)
-            return JsonRpcError(id, -32001, "Findmodule/Findfileoffset is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_FINDMODULE_FINDFILEOFFSET_IS_NOT_AVAILABLE);
         Z0B_MODULE* mod = pFindmodule((ulong)address);
         ulong off = mod ? pFindfileoffset(mod, (ulong)address) : 0;
         std::string result = "{\"ok\":";
@@ -3321,7 +4481,7 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "follow_call") {
         if (!pFollowcall)
-            return JsonRpcError(id, -32001, "Followcall is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_FOLLOWCALL_IS_NOT_AVAILABLE);
         ulong target = pFollowcall((ulong)address);
         std::string result = "{\"ok\":true,\"address\":";
         JsonAppendHex64(result, target);
@@ -3330,7 +4490,7 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "walk_reference") {
         if (!pWalkreference)
-            return JsonRpcError(id, -32001, "Walkreference is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_WALKREFERENCE_IS_NOT_AVAILABLE);
         ulong ref = pWalkreference((int)type_value);
         std::string result = "{\"ok\":";
         result += ref ? "true" : "false";
@@ -3341,7 +4501,7 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "walk_reference_ex") {
         if (!pWalkreferenceex)
-            return JsonRpcError(id, -32001, "Walkreferenceex is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_WALKREFERENCEEX_IS_NOT_AVAILABLE);
         ulong refsize = 0;
         ulong ref = pWalkreferenceex((int)type_value, &refsize);
         std::string result = "{\"ok\":";
@@ -3355,12 +4515,12 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "is_prefix") {
         if (!pIsprefix)
-            return JsonRpcError(id, -32001, "Isprefix is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_ISPREFIX_IS_NOT_AVAILABLE);
         rc = pIsprefix((int)type_value);
     }
     else if (tool == "get_last_error") {
         if (!pGetlasterrorW)
-            return JsonRpcError(id, -32001, "Getlasterror is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_GETLASTERROR_IS_NOT_AVAILABLE);
         ulong error = 0;
         wchar_t buf[TEXTLEN] = { 0 };
         int ok = pGetlasterrorW(NULL, &error, buf);
@@ -3375,7 +4535,7 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "get_cpu_disasm_dump") {
         if (!pGetcpudisasmdump)
-            return JsonRpcError(id, -32001, "Getcpudisasmdump is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_GETCPUDISASMDUMP_IS_NOT_AVAILABLE);
         t_dump* dump = pGetcpudisasmdump();
         if (!dump)
             return JsonRpcResult(id, "{\"ok\":false}");
@@ -3396,7 +4556,7 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "get_cpu_disasm_table") {
         if (!pGetcpudisasmtable)
-            return JsonRpcError(id, -32001, "Getcpudisasmtable is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_GETCPUDISASMTABLE_IS_NOT_AVAILABLE);
         t_table* table = pGetcpudisasmtable();
         std::string result = "{\"ok\":";
         result += table ? "true" : "false";
@@ -3407,9 +4567,9 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "plugin_read_ini_int") {
         if (!pPluginreadintfromini)
-            return JsonRpcError(id, -32001, "Pluginreadintfromini is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_PLUGINREADINTFROMINI_IS_NOT_AVAILABLE);
         if (key.empty())
-            return JsonRpcError(id, -32602, "plugin_read_ini_int requires key");
+            return McpRpcErrorResponse(id, MCP_RPC_PLUGIN_READ_INI_INT_REQUIRES_KEY);
         int defint = (int)type_value;
         int got = pPluginreadintfromini(g_instance, (char*)key.c_str(), defint);
         char num[32];
@@ -3421,16 +4581,16 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "plugin_write_ini_int") {
         if (!pPluginwriteinttoini)
-            return JsonRpcError(id, -32001, "Pluginwriteinttoini is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_PLUGINWRITEINTTOINI_IS_NOT_AVAILABLE);
         if (key.empty())
-            return JsonRpcError(id, -32602, "plugin_write_ini_int requires key");
+            return McpRpcErrorResponse(id, MCP_RPC_PLUGIN_WRITE_INI_INT_REQUIRES_KEY);
         rc = pPluginwriteinttoini(g_instance, (char*)key.c_str(), (int)type_value);
     }
     else if (tool == "plugin_read_ini_string") {
         if (!pPluginreadstringfromini)
-            return JsonRpcError(id, -32001, "Pluginreadstringfromini is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_PLUGINREADSTRINGFROMINI_IS_NOT_AVAILABLE);
         if (key.empty())
-            return JsonRpcError(id, -32602, "plugin_read_ini_string requires key");
+            return McpRpcErrorResponse(id, MCP_RPC_PLUGIN_READ_INI_STRING_REQUIRES_KEY);
         char buf[TEXTLEN] = { 0 };
         int n = pPluginreadstringfromini(g_instance, (char*)key.c_str(), buf, (char*)defvalue.c_str());
         std::string result = "{\"ok\":true,\"read\":";
@@ -3444,9 +4604,9 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "plugin_write_ini_string") {
         if (!pPluginwritestringtoini)
-            return JsonRpcError(id, -32001, "Pluginwritestringtoini is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_PLUGINWRITESTRINGTOINI_IS_NOT_AVAILABLE);
         if (key.empty())
-            return JsonRpcError(id, -32602, "plugin_write_ini_string requires key");
+            return McpRpcErrorResponse(id, MCP_RPC_PLUGIN_WRITE_INI_STRING_REQUIRES_KEY);
         if (value.empty())
             value = text;
         rc = pPluginwritestringtoini(g_instance, (char*)key.c_str(), (char*)value.c_str());
@@ -3486,17 +4646,17 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "show_memory") {
         if (!pListmemory)
-            return JsonRpcError(id, -32001, "Listmemory is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_LISTMEMORY_IS_NOT_AVAILABLE);
         rc = pListmemory();
     }
     else if (tool == "show_breakpoints") {
         if (!pHardbreakpoints)
-            return JsonRpcError(id, -32001, "Hardbreakpoints is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_HARDBREAKPOINTS_IS_NOT_AVAILABLE);
         rc = pHardbreakpoints(0);
     }
     else if (tool == "show_hardware_breakpoints") {
         if (!pHardbreakpoints)
-            return JsonRpcError(id, -32001, "Hardbreakpoints is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_HARDBREAKPOINTS_IS_NOT_AVAILABLE);
         rc = pHardbreakpoints(0);
     }
     else if (tool == "show_trace") {
@@ -3529,42 +4689,42 @@ static std::string ExecuteToolCommand(const std::string& json)
     }
     else if (tool == "set_trace_condition") {
         if (!pSettraceconditionA)
-            return JsonRpcError(id, -32001, "Settracecondition is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_SETTRACECONDITION_IS_NOT_AVAILABLE);
         pSettraceconditionA((char*)condition.c_str(), 0, 0, 0, 0, 0);
         return JsonRpcResult(id, "{\"ok\":true}");
     }
     else if (tool == "set_trace_count") {
         if (!pSettracecount)
-            return JsonRpcError(id, -32001, "Settracecount is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_SETTRACECOUNT_IS_NOT_AVAILABLE);
         pSettracecount((ulong)count);
         return JsonRpcResult(id, "{\"ok\":true}");
     }
     else if (tool == "set_trace_pause_on_commands") {
         if (!pSettracepauseoncommandsA)
-            return JsonRpcError(id, -32001, "Settracepauseoncommands is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_SETTRACEPAUSEONCOMMANDS_IS_NOT_AVAILABLE);
         pSettracepauseoncommandsA((char*)cmdset.c_str());
         return JsonRpcResult(id, "{\"ok\":true}");
     }
     else if (tool == "set_dump_type") {
         if (!pSetdumptype)
-            return JsonRpcError(id, -32001, "Setdumptype is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_SETDUMPTYPE_IS_NOT_AVAILABLE);
         pSetdumptype(NULL, (ulong)type_value);
         return JsonRpcResult(id, "{\"ok\":true}");
     }
     else if (tool == "dump_backup") {
         if (!pDumpbackup)
-            return JsonRpcError(id, -32001, "Dumpbackup is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_DUMPBACKUP_IS_NOT_AVAILABLE);
         pDumpbackup(NULL, (int)type_value);
         return JsonRpcResult(id, "{\"ok\":true}");
     }
     else if (tool == "plugin_module_changed") {
         if (!pPluginmodulechanged)
-            return JsonRpcError(id, -32001, "Pluginmodulechanged is not available");
+            return McpRpcErrorResponse(id, MCP_RPC_PLUGINMODULECHANGED_IS_NOT_AVAILABLE);
         pPluginmodulechanged((ulong)address);
         return JsonRpcResult(id, "{\"ok\":true}");
     }
     else {
-        return JsonRpcError(id, -32601, "unknown tool");
+        return McpRpcErrorResponse(id, MCP_RPC_UNKNOWN_TOOL);
     }
 
     char num[32];
@@ -3668,12 +4828,12 @@ static void HttpServerHandleClient(SOCKET client)
     McpConfig cfg = CopyConfig();
     if (request.find("POST ") != 0) {
         HttpServerSendResponse(client, 405, "Method Not Allowed",
-            "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"POST required\"}}");
+            McpRpcErrorResponse("null", MCP_RPC_POST_REQUIRED));
         return;
     }
     if (!HttpServerAuthorized(cfg, headers)) {
         HttpServerSendResponse(client, 401, "Unauthorized",
-            "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32001,\"message\":\"unauthorized\"}}");
+            McpRpcErrorResponse("null", MCP_RPC_UNAUTHORIZED));
         return;
     }
     std::string body;
@@ -3854,6 +5014,38 @@ static void SetChildFont(HWND parent, HFONT font)
         SendMessageW(child, WM_SETFONT, (WPARAM)font, TRUE);
         child = GetWindow(child, GW_HWNDNEXT);
     }
+}
+
+static void ExpandSettingsDialog(HWND hwnd, HWND owner)
+{
+    RECT window, client;
+    GetWindowRect(hwnd, &window);
+    GetClientRect(hwnd, &client);
+    MONITORINFO monitor = { sizeof(monitor) };
+    GetMonitorInfoW(MonitorFromWindow(owner ? owner : hwnd, MONITOR_DEFAULTTONEAREST), &monitor);
+    const RECT& work = monitor.rcWork;
+    const int old_width = window.right - window.left;
+    const int old_client_width = client.right - client.left;
+    HDC dc = GetDC(hwnd);
+    int dpi = dc ? GetDeviceCaps(dc, LOGPIXELSX) : 96;
+    if (dc) ReleaseDC(hwnd, dc);
+    int scale = (std::max)(125, MulDiv(dpi, 100, 96));
+    int width = (std::min)(MulDiv(old_width, scale, 100), (int)(work.right - work.left - 32));
+    width = (std::max)(width, old_width);
+    int client_width = old_client_width + width - old_width;
+    for (HWND child = GetWindow(hwnd, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT)) {
+        RECT bounds;
+        GetWindowRect(child, &bounds);
+        MapWindowPoints(HWND_DESKTOP, hwnd, (LPPOINT)&bounds, 2);
+        SetWindowPos(child, NULL, MulDiv(bounds.left, client_width, old_client_width), bounds.top,
+            MulDiv(bounds.right - bounds.left, client_width, old_client_width),
+            bounds.bottom - bounds.top, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    int height = window.bottom - window.top;
+    int x = work.left + (work.right - work.left - width) / 2;
+    int y = work.top + (work.bottom - work.top - height) / 2;
+    SetWindowPos(hwnd, NULL, (std::max)((int)work.left, x), (std::max)((int)work.top, y), width, height,
+        SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 static void BrowseCommand(HWND hwnd)
@@ -4574,12 +5766,7 @@ static void ShowAdvancedDialog(HWND owner)
         owner, NULL, g_instance, NULL);
     if (!hwnd)
         return;
-    RECT rc;
-    GetWindowRect(hwnd, &rc);
-    SetWindowPos(hwnd, NULL,
-        (GetSystemMetrics(SM_CXSCREEN) - (rc.right - rc.left)) / 2,
-        (GetSystemMetrics(SM_CYSCREEN) - (rc.bottom - rc.top)) / 2,
-        0, 0, SWP_NOSIZE | SWP_NOZORDER);
+    ExpandSettingsDialog(hwnd, owner);
     if (owner)
         EnableWindow(owner, FALSE);
     ShowWindow(hwnd, SW_SHOW);
@@ -4633,7 +5820,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
         AddEdit(hwnd, IDC_SHARED_KEY, 345, 354, 120, 24, ES_PASSWORD);
         AddLabel(hwnd, 14, 390, 90, 22, McpText(L"超时(ms)", L"Timeout(ms)"));
         AddEdit(hwnd, IDC_TIMEOUT, 115, 388, 90, 24, ES_NUMBER);
-        AddLabel(hwnd, 220, 390, 245, 22,
+        AddLabel(hwnd, 220, 388, 245, 34,
             McpText(L"环境变量每行一个 NAME=VALUE；超时范围：100-600000。",
                     L"One NAME=VALUE per environment line; timeout range: 100-600000."));
         AddButton(hwnd, IDC_AUTO_CONNECT, 14, 424, 150, 22,
@@ -4877,13 +6064,7 @@ static void ShowSettingsDialog(void)
     if (!hwnd)
         return;
 
-    RECT rc;
-    GetWindowRect(hwnd, &rc);
-    int w = rc.right - rc.left;
-    int h = rc.bottom - rc.top;
-    int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2;
-    int y = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
-    SetWindowPos(hwnd, NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+    ExpandSettingsDialog(hwnd, owner);
 
     if (owner)
         EnableWindow(owner, FALSE);
@@ -4965,8 +6146,8 @@ static int __cdecl MenuAbout(t_table*, wchar_t*, ulong, int mode)
         return MENU_NORMAL;
     if (mode == MENU_EXECUTE) {
         MessageBoxW(GetActiveWindow(),
-            McpText(L"MCP Tools 插件\r\n\r\n用于保存和管理 MCP Server 配置，转发调试事件，并提供 81 个 MCP 调试控制工具。\r\n地址参数支持 64 位，x64 构建使用当前调试器的 x64 反汇编/汇编能力。",
-                    L"MCP Tools plugin\r\n\r\nSaves and manages MCP Server configuration, forwards debug events, and exposes 81 MCP debugger control tools.\r\nAddress parameters support 64-bit values. x64 builds use the debugger's x64 disassembly/assembly path."),
+            McpText(L"MCP Tools 插件\r\n\r\n用于保存和管理 MCP Server 配置，转发调试事件，并提供 MCP 调试控制、目标会话和事件等待接口。\r\n地址参数支持 64 位，x64 构建使用当前调试器的 x64 反汇编/汇编能力。",
+                    L"MCP Tools plugin\r\n\r\nSaves and manages MCP Server configuration, forwards debug events, and exposes debugger controls, target sessions and event waiting.\r\nAddress parameters support 64-bit values. x64 builds use the debugger's x64 disassembly/assembly path."),
             PLUGIN_NAME, MB_OK | MB_ICONINFORMATION);
         return MENU_NOREDRAW;
     }
@@ -5000,6 +6181,18 @@ static void UpdateMenuLanguage(void)
     }
 }
 
+typedef void (__cdecl *AgentDirectResult)(const char*, size_t, void*);
+
+extern "C" __declspec(dllexport) BOOL __cdecl Z0B_AgentDirectRequest(
+    const char* request, AgentDirectResult deliver, void* context)
+{
+    if (!request || !deliver || !InterlockedCompareExchange(&g_runtime_ready, 0, 0))
+        return FALSE;
+    std::string response = ExecuteToolCommand(request, true);
+    deliver(response.data(), response.size(), context);
+    return TRUE;
+}
+
 extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH) {
@@ -5028,6 +6221,9 @@ extern "C" __declspec(dllexport) int __cdecl ODBG2_Plugininit(void)
     InitializeCriticalSection(&g_status_cs);
     InitializeCriticalSection(&g_response_cs);
     ResolveHostExports();
+    g_observed_process_id = g_host_process_id && *g_host_process_id ? (DWORD)*g_host_process_id : 0;
+    g_debug_feed.update(CurrentDebugProcessId(), pGetcputhreadid ? (DWORD)pGetcputhreadid() : 0,
+        pMcpDebugState ? pMcpDebugState() : pGetstatus ? pGetstatus() : -1);
     LoadConfig();
     StartWorker();
     InterlockedExchange(&g_runtime_ready, 1);
@@ -5046,6 +6242,11 @@ extern "C" __declspec(dllexport) t_menu* __cdecl ODBG2_Pluginmenu(wchar_t* type)
 
 extern "C" __declspec(dllexport) void __cdecl ODBG2_Pluginmainloop(DEBUG_EVENT* debugevent)
 {
+    if (debugevent) g_observed_process_id = debugevent->dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT ? 0 : debugevent->dwProcessId;
+    DWORD pid = CurrentDebugProcessId();
+    g_debug_feed.update(pid, pGetcputhreadid ? (DWORD)pGetcputhreadid() : 0,
+        pMcpDebugState ? pMcpDebugState() : pGetstatus ? pGetstatus() : -1,
+        debugevent && debugevent->dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT);
     if (debugevent && debugevent->dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT) {
         McpConfig cfg = CopyConfig();
         if (cfg.connect_on_debug_open)
@@ -5056,6 +6257,12 @@ extern "C" __declspec(dllexport) void __cdecl ODBG2_Pluginmainloop(DEBUG_EVENT* 
 
 extern "C" __declspec(dllexport) void __cdecl ODBG2_Pluginnotify(int code, void* data, ulong parm1, ulong parm2)
 {
+    if (code == PN_NEWPROC || code == PN_ENDPROC) {
+        DWORD pid = code == PN_ENDPROC ? 0 : CurrentDebugProcessId();
+        g_debug_feed.update(pid, pGetcputhreadid ? (DWORD)pGetcputhreadid() : 0,
+            pMcpDebugState ? pMcpDebugState() : pGetstatus ? pGetstatus() : -1, true);
+    }
+    if (code == PN_ENDPROC) g_debug_feed.push("{\"notify\":\"process_exit\"}", false, false);
     QueueNotifyEvent(code, data, parm1, parm2);
 }
 

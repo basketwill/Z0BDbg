@@ -1,0 +1,14 @@
+{
+  "title": "Verify paused target",
+  "goal": "Use fresh debugger evidence to verify the target is paused.",
+  "steps": [
+    {
+      "title": "Read target status",
+      "kind": "observation",
+      "criterion": "Debugger status is 18 (paused).",
+      "checks": [
+        {"tool": "get_status", "arguments": {}, "expected": {"return": 18}}
+      ]
+    }
+  ]
+}
